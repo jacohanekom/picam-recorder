@@ -1,0 +1,14 @@
+Source: picam-recorder
+Section: video
+Priority: optional
+Maintainer: Your Name <you@example.com>
+Build-Depends: g++, libavformat-dev, libavcodec-dev, libavutil-dev, pkg-config
+Standards-Version: 4.6.0
+
+Package: picam-recorder
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libavformat-dev, libavcodec-dev, libavutil-dev
+Description: RTSP stream recorder with pre/post buffer
+ Records H.264 RTSP streams to MP4 files with configurable pre-roll
+ and post-roll buffers. Controlled via a TCP plain-text protocol.
+ Writes an MP4 and CSV metadata sidecar per recording.

@@ -1,0 +1,15 @@
+[Unit]
+Description=PiCam Recorder
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/picam-recorder --config /etc/picam-recorder/recorder.ini
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=picam-recorder
+CPUAffinity=2
+
+[Install]
+WantedBy=multi-user.target

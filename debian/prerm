@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+systemctl stop    picam-recorder 2>/dev/null || true
+systemctl disable picam-recorder 2>/dev/null || true

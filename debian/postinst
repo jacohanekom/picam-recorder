@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+systemctl daemon-reload || true
+echo ""
+echo "picam-recorder installed."
+echo "  recorder config : /etc/picam-recorder/recorder.ini"
+echo "  systemd service : /lib/systemd/system/picam-recorder.service"
+echo ""
+echo "  Edit config then: systemctl enable --now picam-recorder"

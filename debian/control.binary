@@ -1,0 +1,11 @@
+Package: picam-recorder
+Version: 1.0.0+202606031613
+Architecture: arm64
+Maintainer: Your Name <you@example.com>
+Depends: libavformat-dev, libavcodec-dev, libavutil-dev
+Section: video
+Priority: optional
+Description: RTSP stream recorder with pre/post buffer
+ Records H.264 RTSP streams to MP4 files with configurable pre-roll
+ and post-roll buffers. Controlled via a TCP plain-text protocol.
+ Writes an MP4 and CSV metadata sidecar per recording.
