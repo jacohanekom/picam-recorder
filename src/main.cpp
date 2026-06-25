@@ -1,18 +1,24 @@
 /**
- * rtsp_recorder — C++ port of main.go
+ * picam_recorder — records raw YUV420 frames from picam-raw UDP stream to MP4
+ *
+ * Receives uncompressed YUV420 frames via picam-raw's UDP chunk protocol,
+ * encodes them to H.264 with FFmpeg (libx264), and muxes to MP4 files with
+ * pre-roll and post-roll buffering.
  *
  * Dependencies:
- *   - FFmpeg libs: libavformat, libavcodec, libavutil  (RTSP + MP4 muxing)
+ *   - FFmpeg libs: libavformat, libavcodec, libavutil  (encoding + MP4 muxing)
  *   No other external dependencies.
  *
  * Build example (Linux / macOS):
  *   g++ -std=c++17 -O2 -pthread \
  *       main.cpp \
  *       $(pkg-config --cflags --libs libavformat libavcodec libavutil) \
- *       -o rtsp_recorder
+ *       -o picam-recorder
  *
  * Usage:
- *   ./rtsp_recorder [--config recorder.ini] [--rtsp <url>] [--port <n>] [--pre <s>] [--post <s>]
+ *   ./picam-recorder [--config recorder.ini] [--raw-host <host>] [--raw-port <n>]
+ *                    [--raw-width <n>] [--raw-height <n>] [--raw-fps <n>]
+ *                    [--raw-stride <n>] [--port <n>] [--pre <s>] [--post <s>]
  *
  * Control — TCP plain-text protocol (one command per line):
  *
@@ -45,6 +51,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/time.h>
 }
 
@@ -65,6 +72,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -74,19 +82,24 @@ using TP     = Clock::time_point;
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr int         kDefaultPort    = 8080;
-static constexpr double      kDefaultPreSecs  = 10.0;
-static constexpr double      kDefaultPostSecs = 10.0;
+static constexpr int    kDefaultPort     = 8080;
+static constexpr double kDefaultPreSecs  = 10.0;
+static constexpr double kDefaultPostSecs = 10.0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config  — INI / key=value file + CLI override
 // ─────────────────────────────────────────────────────────────────────────────
 struct Config {
-    std::string rtspURL  = "rtsp://127.0.0.1:8554/main";
-    std::string dir      = "recordings";
-    int         port     = kDefaultPort;
-    double      preSecs  = kDefaultPreSecs;
-    double      postSecs = kDefaultPostSecs;
+    std::string rawHost   = "127.0.0.1";
+    int         rawPort   = 8560;
+    int         rawWidth  = 2304;
+    int         rawHeight = 1296;
+    int         rawFps    = 30;
+    int         rawStride = 0;      // 0 = same as rawWidth
+    std::string dir       = "recordings";
+    int         port      = kDefaultPort;
+    double      preSecs   = kDefaultPreSecs;
+    double      postSecs  = kDefaultPostSecs;
 };
 
 static Config loadIni(const std::string& path)
@@ -130,11 +143,16 @@ static Config loadIni(const std::string& path)
         if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
             val = val.substr(1, val.size() - 2);
 
-        if      (key == "rtsp")  cfg.rtspURL  = val;
-        else if (key == "dir")   cfg.dir      = val;
-        else if (key == "port")  cfg.port     = std::stoi(val);
-        else if (key == "pre")   cfg.preSecs  = std::stod(val);
-        else if (key == "post")  cfg.postSecs = std::stod(val);
+        if      (key == "raw_host")   cfg.rawHost   = val;
+        else if (key == "raw_port")   cfg.rawPort   = std::stoi(val);
+        else if (key == "raw_width")  cfg.rawWidth  = std::stoi(val);
+        else if (key == "raw_height") cfg.rawHeight = std::stoi(val);
+        else if (key == "raw_fps")    cfg.rawFps    = std::stoi(val);
+        else if (key == "raw_stride") cfg.rawStride = std::stoi(val);
+        else if (key == "dir")        cfg.dir       = val;
+        else if (key == "port")       cfg.port      = std::stoi(val);
+        else if (key == "pre")        cfg.preSecs   = std::stod(val);
+        else if (key == "post")       cfg.postSecs  = std::stod(val);
         else
             std::cerr << "[cfg] " << path << ":" << lineNo << ": unknown key '" << key << "'\n";
     }
@@ -173,6 +191,7 @@ struct BufferedNALU {
     std::vector<uint8_t> nalu;
     uint32_t             dts;
     TP                   wallTime;
+    uint32_t             frameSeq;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,10 +201,10 @@ class RollingBuffer {
 public:
     explicit RollingBuffer(double secs) : secs_(secs) {}
 
-    void push(std::vector<uint8_t> nalu, uint32_t dts, TP wallTime)
+    void push(std::vector<uint8_t> nalu, uint32_t dts, TP wallTime, uint32_t frameSeq)
     {
         std::lock_guard<std::mutex> lk(mu_);
-        frames_.push_back({ std::move(nalu), dts, wallTime });
+        frames_.push_back({ std::move(nalu), dts, wallTime, frameSeq });
         auto cutoff = Clock::now() -
                       std::chrono::duration_cast<Clock::duration>(
                           std::chrono::duration<double>(secs_));
@@ -220,11 +239,13 @@ public:
         path_ = p.replace_extension(".csv").string();
     }
 
-    void record(int nalType, uint32_t dts, TP wallTime)
+    void record(int nalType, uint32_t dts, TP wallTime, uint32_t frameSeq)
     {
+        int64_t tsUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                           wallTime.time_since_epoch()).count();
         std::lock_guard<std::mutex> lk(mu_);
         ++count_;
-        rows_.push_back({ count_, dts, toRFC3339(wallTime), nalType });
+        rows_.push_back({ count_, dts, tsUs, toRFC3339(wallTime), nalType, frameSeq });
     }
 
     bool close()
@@ -232,14 +253,15 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         std::ofstream f(path_);
         if (!f) return false;
-        f << "frame,rtp_time,wall_time,nal_type\n";
+        f << "frame,frame_seq,ts_us,rtp_time,wall_time,nal_type\n";
         for (auto& r : rows_)
-            f << r.frame << ',' << r.dts << ',' << r.wallTime << ',' << r.nalType << '\n';
+            f << r.frame << ',' << r.frameSeq << ',' << r.tsUs << ','
+              << r.dts << ',' << r.wallTime << ',' << r.nalType << '\n';
         return true;
     }
 
 private:
-    struct Row { int frame; uint32_t dts; std::string wallTime; int nalType; };
+    struct Row { int frame; uint32_t dts; int64_t tsUs; std::string wallTime; int nalType; uint32_t frameSeq; };
 
     std::mutex       mu_;
     std::string      path_;
@@ -463,14 +485,12 @@ public:
     MP4Muxer(const MP4Muxer&)            = delete;
     MP4Muxer& operator=(const MP4Muxer&) = delete;
 
-    void writeNALU(const std::vector<uint8_t>& nalu, uint32_t dts, TP wallTime)
+    void writeNALU(const std::vector<uint8_t>& nalu, uint32_t dts, TP wallTime, uint32_t frameSeq)
     {
         std::lock_guard<std::mutex> lk(mu_);
 
-        // Accumulate a monotonic 64-bit DTS from the 32-bit RTP timestamp.
+        // Accumulate a monotonic 64-bit DTS from the 32-bit RTP-scale timestamp.
         // Use signed 32-bit delta so wraparound is handled correctly.
-        // Track lastDelta_ so zero/reordered packets advance by the most
-        // recently seen inter-frame interval rather than a hardcoded fps.
         if (!baseSet_) {
             prevRTP_    = dts;
             accumDTS_   = 0;
@@ -482,7 +502,6 @@ public:
                 lastDelta_ = static_cast<uint32_t>(delta);
                 accumDTS_ += lastDelta_;
             } else {
-                // Zero delta (same timestamp) or reordered — reuse last interval
                 accumDTS_ += lastDelta_;
             }
             prevRTP_ = dts;
@@ -508,7 +527,7 @@ public:
         if (av_interleaved_write_frame(fmtCtx_, pkt_) < 0)
             std::cerr << "[mp4] write error\n";
 
-        meta_.record(static_cast<int>(nalu[0] & 0x1F), dts, wallTime);
+        meta_.record(static_cast<int>(nalu[0] & 0x1F), dts, wallTime, frameSeq);
         ++naluCount_;
     }
 
@@ -523,14 +542,14 @@ public:
 
 private:
     std::mutex       mu_;
-    AVFormatContext* fmtCtx_   = nullptr;
-    AVStream*        stream_   = nullptr;
-    AVPacket*        pkt_      = nullptr;
+    AVFormatContext* fmtCtx_    = nullptr;
+    AVStream*        stream_    = nullptr;
+    AVPacket*        pkt_       = nullptr;
     MetaWriter       meta_;
-    uint32_t         prevRTP_    = 0;
-    uint64_t         accumDTS_   = 0;
-    uint32_t         lastDelta_  = 3000;
-    bool             baseSet_    = false;
+    uint32_t         prevRTP_   = 0;
+    uint64_t         accumDTS_  = 0;
+    uint32_t         lastDelta_ = 3000;
+    bool             baseSet_   = false;
     int              naluCount_ = 0;
 };
 
@@ -546,11 +565,21 @@ struct RecorderStatus {
 
 class Recorder {
 public:
-    explicit Recorder(std::string rtspURL,
+    explicit Recorder(std::string rawHost,
+                      int         rawPort,
+                      int         rawWidth,
+                      int         rawHeight,
+                      int         rawFps,
+                      int         rawStride,
                       std::string dir,
                       double preBufferSecs  = kDefaultPreSecs,
                       double postBufferSecs = kDefaultPostSecs)
-        : rtspURL_(std::move(rtspURL))
+        : rawHost_(std::move(rawHost))
+        , rawPort_(rawPort)
+        , rawWidth_(rawWidth)
+        , rawHeight_(rawHeight)
+        , rawFps_(rawFps)
+        , rawStride_(rawStride > 0 ? rawStride : rawWidth)
         , dir_(std::move(dir))
         , preBuf_(preBufferSecs)
         , preBufferSecs_(preBufferSecs)
@@ -566,6 +595,9 @@ public:
         drainCv_.notify_all();
         if (drainThread_.joinable())  drainThread_.join();
         if (readerThread_.joinable()) readerThread_.join();
+        if (encFrame_) av_frame_free(&encFrame_);
+        if (encPkt_)   av_packet_free(&encPkt_);
+        if (encCtx_)   avcodec_free_context(&encCtx_);
     }
 
     std::string start(const std::string& filename)
@@ -586,8 +618,7 @@ public:
             }
         }
 
-        // ── Idle: open a new file ─────────────────────────────────────────────
-        // Wait up to 10s for SPS/PPS
+        // ── Idle: wait for SPS/PPS from first encoded IDR frame ───────────────
         {
             std::unique_lock<std::mutex> lk(spsPpsMu_);
             bool ready = spsPpsCv_.wait_for(lk, std::chrono::seconds(10),
@@ -600,8 +631,7 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
 
             fs::create_directories(dir_);
-            // Strip any extension the caller may have provided, then add .mp4
-            std::string stem = fs::path(filename).stem().string();
+            std::string stem    = fs::path(filename).stem().string();
             std::string outPath = (fs::path(dir_) / (stem + ".mp4")).string();
 
             if (fs::exists(outPath))
@@ -615,7 +645,7 @@ public:
             auto pre = preBuf_.drain();
             std::cout << "[rec] Pre-buffer: flushing " << pre.size() << " frames\n";
             for (auto& f : pre)
-                muxer_->writeNALU(f.nalu, f.dts, f.wallTime);
+                muxer_->writeNALU(f.nalu, f.dts, f.wallTime, f.frameSeq);
 
             std::cout << "[rec] Recording started: " << outPath << "\n";
             return outPath;
@@ -654,7 +684,6 @@ public:
     double postBufferSecs() const { return postBufferSecs_; }
     const std::string& dir() const { return dir_; }
 
-    /** Block until the RTSP stream delivers its first SPS/PPS, or timeout. */
     bool waitForStream(int timeoutSecs = 60)
     {
         std::unique_lock<std::mutex> lk(spsPpsMu_);
@@ -666,22 +695,19 @@ public:
     bool streamReady() const { return spsPpsReady_.load(); }
 
 private:
-    void writeNALU(std::vector<uint8_t> nalu, uint32_t dts, TP wallTime)
+    void writeNALU(std::vector<uint8_t> nalu, uint32_t dts, TP wallTime, uint32_t frameSeq)
     {
-        preBuf_.push(nalu, dts, wallTime);
+        preBuf_.push(nalu, dts, wallTime, frameSeq);
         std::lock_guard<std::mutex> lk(mu_);
         if ((state_ == RecordState::Recording || state_ == RecordState::Draining) && muxer_)
-            muxer_->writeNALU(nalu, dts, wallTime);
+            muxer_->writeNALU(nalu, dts, wallTime, frameSeq);
     }
 
-    // Single persistent drain thread — loops forever waiting for Stop signals.
-    // Never needs to be joined or respawned between recordings.
     void drainLoop()
     {
         while (!shutdown_) {
             std::string path;
 
-            // ── Phase 1: wait for a Stop command ─────────────────────────────
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 drainCv_.wait(lk, [this]{
@@ -691,18 +717,15 @@ private:
                 });
                 if (shutdown_) return;
                 if (drainCmd_ == DrainCmd::Resume) {
-                    // Resume arrived before stop — reset and wait again
                     drainCmd_ = DrainCmd::Wait;
                     continue;
                 }
-                // drainCmd_ == Stop
                 path = current_;
             }
 
             std::cout << "[rec] " << toRFC3339(Clock::now())
                       << " post-buffer: recording for " << postBufferSecs_ << "s more\n";
 
-            // ── Phase 2: post-buffer wait, cancellable by Resume ─────────────
             bool resumed = false;
             {
                 std::unique_lock<std::mutex> lk(mu_);
@@ -724,7 +747,6 @@ private:
                 continue;
             }
 
-            // ── Phase 3: close the file ───────────────────────────────────────
             auto closeTime = Clock::now();
             auto recSecs   = std::chrono::duration<double>(closeTime - stopTime_).count();
 
@@ -747,168 +769,296 @@ private:
         }
     }
 
-    TP rtpToWall(uint32_t dts)
+    // ── H.264 encoder init ────────────────────────────────────────────────────
+    void initEncoder()
     {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!srSet_) return Clock::now();
-        static constexpr uint64_t kNtpToUnix = 2'208'988'800ULL;
-        double wallSec  = static_cast<double>(ntpSec_) - kNtpToUnix;
-        double wallFrac = static_cast<double>(ntpFrac_) / 4294967296.0;
-        double diffSec  = static_cast<double>(static_cast<int32_t>(
-                              static_cast<uint32_t>(dts) - static_cast<uint32_t>(rtpRef_))) / 90000.0;
-        double t   = wallSec + wallFrac + diffSec;
-        auto sec   = static_cast<int64_t>(t);
-        auto ns    = static_cast<int64_t>((t - static_cast<double>(sec)) * 1e9);
-        return Clock::from_time_t(static_cast<time_t>(sec)) + std::chrono::nanoseconds(ns);
+        const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        if (!codec)
+            throw std::runtime_error("H.264 encoder not found (need FFmpeg with libx264)");
+
+        encCtx_ = avcodec_alloc_context3(codec);
+        if (!encCtx_)
+            throw std::runtime_error("avcodec_alloc_context3 failed");
+
+        encCtx_->width        = rawWidth_;
+        encCtx_->height       = rawHeight_;
+        encCtx_->time_base    = { 1, rawFps_ };
+        encCtx_->framerate    = { rawFps_, 1 };
+        encCtx_->pix_fmt      = AV_PIX_FMT_YUV420P;
+        encCtx_->gop_size     = rawFps_;   // IDR every second
+        encCtx_->max_b_frames = 0;
+
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "preset", "ultrafast", 0);
+        av_dict_set(&opts, "tune",   "zerolatency", 0);
+
+        int ret = avcodec_open2(encCtx_, codec, &opts);
+        av_dict_free(&opts);
+        if (ret < 0) {
+            char err[128]; av_strerror(ret, err, sizeof(err));
+            throw std::runtime_error(std::string("avcodec_open2: ") + err);
+        }
+
+        encFrame_ = av_frame_alloc();
+        if (!encFrame_) throw std::runtime_error("av_frame_alloc failed");
+        encFrame_->format = AV_PIX_FMT_YUV420P;
+        encFrame_->width  = rawWidth_;
+        encFrame_->height = rawHeight_;
+        if (av_frame_get_buffer(encFrame_, 0) < 0)
+            throw std::runtime_error("av_frame_get_buffer failed");
+
+        encPkt_ = av_packet_alloc();
+        if (!encPkt_) throw std::runtime_error("av_packet_alloc for encoder failed");
+
+        std::cout << "[raw] Encoder ready: H.264 " << rawWidth_ << "x" << rawHeight_
+                  << " @" << rawFps_ << "fps  stride=" << rawStride_ << "\n";
+    }
+
+    // ── Encode one YUV420 frame and dispatch resulting NALUs ─────────────────
+    void encodeFrame(const std::vector<uint8_t>& yuv, int64_t timestampUs, uint32_t frameSeq)
+    {
+        const int    uvStride = rawStride_ / 2;
+        const int    uvHeight = rawHeight_ / 2;
+        const int    uvWidth  = rawWidth_  / 2;
+        const size_t yBytes   = static_cast<size_t>(rawStride_) * rawHeight_;
+        const size_t uvBytes  = static_cast<size_t>(uvStride) * uvHeight;
+
+        if (yuv.size() < yBytes + 2 * uvBytes) {
+            std::cerr << "[raw] Frame size " << yuv.size()
+                      << " < expected " << (yBytes + 2 * uvBytes) << " — skipping\n";
+            return;
+        }
+
+        if (av_frame_make_writable(encFrame_) < 0) return;
+
+        // Copy each plane row-by-row, stripping stride padding
+        for (int row = 0; row < rawHeight_; ++row)
+            std::memcpy(encFrame_->data[0] + row * encFrame_->linesize[0],
+                        yuv.data() + row * rawStride_, rawWidth_);
+        for (int row = 0; row < uvHeight; ++row)
+            std::memcpy(encFrame_->data[1] + row * encFrame_->linesize[1],
+                        yuv.data() + yBytes + row * uvStride, uvWidth);
+        for (int row = 0; row < uvHeight; ++row)
+            std::memcpy(encFrame_->data[2] + row * encFrame_->linesize[2],
+                        yuv.data() + yBytes + uvBytes + row * uvStride, uvWidth);
+
+        encFrame_->pts = encPts_++;
+
+        TP       wallTime = std::chrono::system_clock::time_point(
+                                std::chrono::microseconds(timestampUs));
+        uint32_t dts      = static_cast<uint32_t>((timestampUs * 90LL) / 1000LL);
+
+        if (avcodec_send_frame(encCtx_, encFrame_) < 0) return;
+
+        while (avcodec_receive_packet(encCtx_, encPkt_) == 0) {
+            dispatchEncodedPacket(encPkt_, dts, wallTime, frameSeq);
+            av_packet_unref(encPkt_);
+        }
+    }
+
+    // ── Split an encoded packet into NALUs and dispatch each one ─────────────
+    void dispatchEncodedPacket(AVPacket* pkt, uint32_t dts, TP wallTime, uint32_t frameSeq)
+    {
+        const uint8_t* p   = pkt->data;
+        const uint8_t* end = pkt->data + pkt->size;
+
+        // libx264 without GLOBAL_HEADER outputs Annex-B
+        bool annexB = (pkt->size >= 4 &&
+                       p[0] == 0 && p[1] == 0 &&
+                       (p[2] == 1 || (p[2] == 0 && p[3] == 1)));
+
+        auto dispatchNALU = [&](const uint8_t* nalu, size_t len) {
+            if (len == 0) return;
+            uint8_t nalType = nalu[0] & 0x1F;
+            std::vector<uint8_t> v(nalu, nalu + len);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (nalType == 7) sps_ = v;
+                else if (nalType == 8) pps_ = v;
+            }
+            // Signal ready once both SPS and PPS are available
+            if (nalType == 7 || nalType == 8) {
+                bool hasBoth;
+                { std::lock_guard<std::mutex> lk(mu_); hasBoth = !sps_.empty() && !pps_.empty(); }
+                if (hasBoth) {
+                    { std::lock_guard<std::mutex> slk(spsPpsMu_); spsPpsReady_ = true; }
+                    spsPpsCv_.notify_all();
+                }
+            }
+            writeNALU(std::move(v), dts, wallTime, frameSeq);
+        };
+
+        if (annexB) {
+            const uint8_t* naluStart = nullptr;
+            while (p < end) {
+                bool sc3 = (p + 3 <= end && p[0]==0 && p[1]==0 && p[2]==1);
+                bool sc4 = (p + 4 <= end && p[0]==0 && p[1]==0 && p[2]==0 && p[3]==1);
+                if (sc3 || sc4) {
+                    if (naluStart) {
+                        const uint8_t* naluEnd = p;
+                        while (naluEnd > naluStart && *(naluEnd-1) == 0) --naluEnd;
+                        dispatchNALU(naluStart, naluEnd - naluStart);
+                    }
+                    p += sc4 ? 4 : 3;
+                    naluStart = p;
+                } else {
+                    ++p;
+                }
+            }
+            if (naluStart && naluStart < end)
+                dispatchNALU(naluStart, end - naluStart);
+        } else {
+            // AVCC: 4-byte big-endian length prefix
+            while (p + 4 <= end) {
+                uint32_t naluLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+                                   (uint32_t(p[2]) <<  8) |  uint32_t(p[3]);
+                p += 4;
+                if (p + naluLen > end) break;
+                dispatchNALU(p, naluLen);
+                p += naluLen;
+            }
+        }
+    }
+
+    // ── Connect to picam-raw UDP stream, reassemble frames, encode ────────────
+    void connectRaw()
+    {
+        int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
+            throw std::runtime_error("socket: " + std::string(strerror(errno)));
+
+        // 1-second receive timeout so we can check shutdown_
+        struct timeval tv{ 1, 0 };
+        ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Large receive buffer to absorb UDP bursts
+        int rcvBuf = 8 * 1024 * 1024;
+        ::setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvBuf, sizeof(rcvBuf));
+
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port   = htons(static_cast<uint16_t>(rawPort_));
+        ::inet_pton(AF_INET, rawHost_.c_str(), &serverAddr.sin_addr);
+
+        // Register with picam-raw (any datagram registers the sender as a client)
+        const uint8_t regByte = 0x01;
+        if (::sendto(sock, &regByte, 1, 0,
+                     reinterpret_cast<const sockaddr*>(&serverAddr),
+                     sizeof(serverAddr)) < 0) {
+            ::close(sock);
+            throw std::runtime_error("sendto (register): " + std::string(strerror(errno)));
+        }
+        std::cout << "[raw] Registered with " << rawHost_ << ":" << rawPort_ << "\n";
+
+        struct PendingFrame {
+            std::vector<std::vector<uint8_t>> chunks;
+            uint16_t received    = 0;
+            uint16_t total       = 0;
+            int64_t  timestampUs = 0;
+        };
+        std::unordered_map<uint32_t, PendingFrame> pending;
+
+        auto keepaliveAt = std::chrono::steady_clock::now();
+        std::vector<uint8_t> buf(65536);
+
+        while (!shutdown_) {
+            // Keepalive: picam-raw removes clients silent for >10s
+            {
+                auto now = std::chrono::steady_clock::now();
+                if (now - keepaliveAt >= std::chrono::seconds(5)) {
+                    ::sendto(sock, &regByte, 1, 0,
+                             reinterpret_cast<const sockaddr*>(&serverAddr),
+                             sizeof(serverAddr));
+                    keepaliveAt = now;
+                }
+            }
+
+            ssize_t n = ::recv(sock, buf.data(), buf.size(), 0);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                ::close(sock);
+                throw std::runtime_error("recv: " + std::string(strerror(errno)));
+            }
+            if (n < 8) continue;
+
+            // Parse common 8-byte chunk header
+            uint32_t frameSeq    = (uint32_t(buf[0])<<24)|(uint32_t(buf[1])<<16)|
+                                   (uint32_t(buf[2])<< 8)| uint32_t(buf[3]);
+            uint16_t chunkSeq    = (uint16_t(buf[4])<<8)| uint16_t(buf[5]);
+            uint16_t totalChunks = (uint16_t(buf[6])<<8)| uint16_t(buf[7]);
+
+            size_t  payloadOffset;
+            int64_t timestampUs = 0;
+
+            if (chunkSeq == 0) {
+                // Chunk 0 has an extended 32-byte header with metadata
+                if (n < 32) continue;
+                for (int i = 0; i < 8; ++i)
+                    timestampUs = (timestampUs << 8) | buf[8 + i];
+                payloadOffset = 32;
+
+                auto& pf       = pending[frameSeq];
+                pf.total       = totalChunks;
+                pf.timestampUs = timestampUs;
+                pf.chunks.assign(totalChunks, {});
+                pf.received    = 0;
+            } else {
+                payloadOffset = 8;
+            }
+
+            if (n <= static_cast<ssize_t>(payloadOffset)) continue;
+
+            auto it = pending.find(frameSeq);
+            if (it == pending.end()) continue;   // chunk 0 not yet seen for this frame
+            PendingFrame& pf = it->second;
+            if (chunkSeq >= pf.total) continue;
+            if (pf.chunks[chunkSeq].empty()) {
+                pf.chunks[chunkSeq].assign(buf.data() + payloadOffset, buf.data() + n);
+                ++pf.received;
+            }
+
+            if (pf.received == pf.total) {
+                // All chunks arrived — reassemble frame and encode
+                std::vector<uint8_t> yuv;
+                size_t totalSize = 0;
+                for (auto& c : pf.chunks) totalSize += c.size();
+                yuv.reserve(totalSize);
+                for (auto& c : pf.chunks)
+                    yuv.insert(yuv.end(), c.begin(), c.end());
+
+                int64_t  ts  = pf.timestampUs;
+                uint32_t seq = frameSeq;
+                pending.erase(it);
+                encodeFrame(yuv, ts, seq);
+            }
+
+            // Prune excessively old incomplete frames to cap memory use
+            if (pending.size() > 120) {
+                auto oldest = pending.begin();
+                std::cerr << "[raw] Dropped incomplete frame " << oldest->first << "\n";
+                pending.erase(oldest);
+            }
+        }
+
+        ::close(sock);
     }
 
     void readStream()
     {
+        try {
+            initEncoder();
+        } catch (const std::exception& e) {
+            std::cerr << "[raw] Encoder init failed: " << e.what() << "\n";
+            return;
+        }
+
         while (!shutdown_) {
-            try { connect(); }
+            try { connectRaw(); }
             catch (const std::exception& e) {
-                std::cerr << "[rtsp] Error: " << e.what() << " — retrying in 3s\n";
+                std::cerr << "[raw] Error: " << e.what() << " — retrying in 3s\n";
             }
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-        }
-    }
-
-    void connect()
-    {
-        AVFormatContext* inCtx = nullptr;
-        AVDictionary*    opts  = nullptr;
-        av_dict_set(&opts, "rtsp_transport", "udp", 0);
-        av_dict_set(&opts, "stimeout", "5000000", 0);
-
-        int ret = avformat_open_input(&inCtx, rtspURL_.c_str(), nullptr, &opts);
-        av_dict_free(&opts);
-        if (ret < 0) {
-            char err[128]; av_strerror(ret, err, sizeof(err));
-            throw std::runtime_error(std::string("avformat_open_input: ") + err);
-        }
-        auto closeGuard = [&]{ avformat_close_input(&inCtx); };
-
-        if (avformat_find_stream_info(inCtx, nullptr) < 0) {
-            closeGuard();
-            throw std::runtime_error("avformat_find_stream_info failed");
-        }
-
-        int videoIdx = -1;
-        for (unsigned i = 0; i < inCtx->nb_streams; ++i)
-            if (inCtx->streams[i]->codecpar->codec_id == AV_CODEC_ID_H264)
-                { videoIdx = static_cast<int>(i); break; }
-        if (videoIdx < 0) { closeGuard(); throw std::runtime_error("H264 track not found"); }
-
-        AVStream* vs = inCtx->streams[videoIdx];
-        if (vs->codecpar->extradata && vs->codecpar->extradata_size > 0)
-            parseSPSPPS(vs->codecpar->extradata, vs->codecpar->extradata_size);
-
-        std::cout << "[rtsp] Connected: " << rtspURL_ << "\n";
-
-        AVPacket* pkt = av_packet_alloc();
-        if (!pkt) { closeGuard(); throw std::runtime_error("av_packet_alloc"); }
-
-        while (!shutdown_) {
-            ret = av_read_frame(inCtx, pkt);
-            if (ret < 0) {
-                av_packet_free(&pkt); closeGuard();
-                char err[128]; av_strerror(ret, err, sizeof(err));
-                throw std::runtime_error(std::string("av_read_frame: ") + err);
-            }
-
-            if (pkt->stream_index == videoIdx) {
-                uint32_t dts      = static_cast<uint32_t>(pkt->dts);
-                TP       wallTime = rtpToWall(dts);
-
-                const uint8_t* p   = pkt->data;
-                const uint8_t* end = pkt->data + pkt->size;
-
-                // Detect format: Annex-B starts with 00 00 00 01 or 00 00 01
-                bool annexB = (pkt->size >= 4 &&
-                               p[0] == 0 && p[1] == 0 &&
-                               (p[2] == 1 || (p[2] == 0 && p[3] == 1)));
-
-                auto dispatchNALU = [&](const uint8_t* nalu, size_t len) {
-                    if (len == 0) return;
-                    uint8_t nalType = nalu[0] & 0x1F;
-                    std::vector<uint8_t> v(nalu, nalu + len);
-                    if (nalType == 7) {
-                        std::lock_guard<std::mutex> lk(mu_);
-                        sps_ = v;
-                        { std::lock_guard<std::mutex> slk(spsPpsMu_); spsPpsReady_ = true; }
-                        spsPpsCv_.notify_all();
-                    } else if (nalType == 8) {
-                        std::lock_guard<std::mutex> lk(mu_);
-                        pps_ = v;
-                        { std::lock_guard<std::mutex> slk(spsPpsMu_); spsPpsReady_ = true; }
-                        spsPpsCv_.notify_all();
-                    }
-                    writeNALU(v, dts, wallTime);
-                };
-
-                if (annexB) {
-                    // Split on start codes (00 00 01 or 00 00 00 01)
-                    const uint8_t* naluStart = nullptr;
-                    while (p < end) {
-                        // Look for next start code
-                        bool sc3 = (p + 3 <= end && p[0]==0 && p[1]==0 && p[2]==1);
-                        bool sc4 = (p + 4 <= end && p[0]==0 && p[1]==0 && p[2]==0 && p[3]==1);
-                        if (sc3 || sc4) {
-                            if (naluStart) {
-                                // Trim any trailing zero bytes before this start code
-                                const uint8_t* naluEnd = p;
-                                while (naluEnd > naluStart && *(naluEnd-1) == 0) --naluEnd;
-                                dispatchNALU(naluStart, naluEnd - naluStart);
-                            }
-                            p += sc4 ? 4 : 3;
-                            naluStart = p;
-                        } else {
-                            ++p;
-                        }
-                    }
-                    if (naluStart && naluStart < end)
-                        dispatchNALU(naluStart, end - naluStart);
-                } else {
-                    // AVCC: 4-byte big-endian length prefix
-                    while (p + 4 <= end) {
-                        uint32_t naluLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
-                                           (uint32_t(p[2]) <<  8) |  uint32_t(p[3]);
-                        p += 4;
-                        if (p + naluLen > end) break;
-                        dispatchNALU(p, naluLen);
-                        p += naluLen;
-                    }
-                }
-            }
-            av_packet_unref(pkt);
-        }
-        av_packet_free(&pkt);
-        closeGuard();
-    }
-
-    void parseSPSPPS(const uint8_t* data, int size)
-    {
-        if (size < 8) return;
-        int numSPS = data[5] & 0x1F, offset = 6;
-        for (int i = 0; i < numSPS && offset + 2 <= size; ++i) {
-            int len = (data[offset] << 8) | data[offset + 1]; offset += 2;
-            if (offset + len > size) break;
-            { std::lock_guard<std::mutex> lk(mu_); sps_.assign(data+offset, data+offset+len); }
-            { std::lock_guard<std::mutex> slk(spsPpsMu_); spsPpsReady_ = true; }
-            spsPpsCv_.notify_all();
-            std::cout << "[rtsp] SPS from extradata: " << len << " bytes\n";
-            offset += len;
-        }
-        if (offset >= size) return;
-        int numPPS = data[offset++];
-        for (int i = 0; i < numPPS && offset + 2 <= size; ++i) {
-            int len = (data[offset] << 8) | data[offset + 1]; offset += 2;
-            if (offset + len > size) break;
-            { std::lock_guard<std::mutex> lk(mu_); pps_.assign(data+offset, data+offset+len); }
-            { std::lock_guard<std::mutex> slk(spsPpsMu_); spsPpsReady_ = true; }
-            spsPpsCv_.notify_all();
-            std::cout << "[rtsp] PPS from extradata: " << len << " bytes\n";
-            offset += len;
+            if (!shutdown_)
+                std::this_thread::sleep_for(std::chrono::seconds(3));
         }
     }
 
@@ -917,7 +1067,12 @@ private:
     RecordState               state_   = RecordState::Idle;
     std::string               current_;
     std::unique_ptr<MP4Muxer> muxer_;
-    std::string               rtspURL_;
+    std::string               rawHost_;
+    int                       rawPort_;
+    int                       rawWidth_;
+    int                       rawHeight_;
+    int                       rawFps_;
+    int                       rawStride_;
     std::string               dir_;
     std::vector<uint8_t>      sps_, pps_;
     RollingBuffer             preBuf_;
@@ -932,31 +1087,21 @@ private:
     TP                        stopTime_;
 
     enum class DrainCmd { Wait, Stop, Resume };
-    DrainCmd                  drainCmd_  = DrainCmd::Wait;
+    DrainCmd                  drainCmd_ = DrainCmd::Wait;
 
     std::mutex                spsPpsMu_;
     std::atomic<bool>         spsPpsReady_{ false };
     std::condition_variable   spsPpsCv_;
 
-    uint64_t ntpSec_  = 0;
-    uint32_t ntpFrac_ = 0;
-    uint32_t rtpRef_  = 0;
-    bool     srSet_   = false;
+    // H.264 encoder (used only from readerThread_)
+    AVCodecContext*           encCtx_   = nullptr;
+    AVFrame*                  encFrame_ = nullptr;
+    AVPacket*                 encPkt_   = nullptr;
+    int64_t                   encPts_   = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ControlServer — TCP, plain-text line protocol
-//
-// Request:  one command per line
-//   start <filename.mp4>
-//   stop
-//   status
-//   list
-//
-// Response: key=value lines, terminated by a blank line
-//   ok=true
-//   file=recordings/clip01.mp4
-//   <blank line>
 // ─────────────────────────────────────────────────────────────────────────────
 class Server {
 public:
@@ -982,13 +1127,13 @@ public:
         if (::listen(listenFd_, 8) < 0)
             throw std::runtime_error(std::string("listen: ") + strerror(errno));
 
-        // Wait for the RTSP stream to deliver SPS/PPS before accepting commands
-        std::cout << "[tcp] Waiting for RTSP stream before accepting connections...\n";
+        // Wait for the first encoded frame to deliver SPS/PPS before accepting commands
+        std::cout << "[tcp] Waiting for stream before accepting connections...\n";
         if (!rec_.waitForStream(60)) {
-            std::cerr << "[tcp] Timed out waiting for RTSP stream — "
+            std::cerr << "[tcp] Timed out waiting for stream — "
                          "still opening control port but stream may not be ready\n";
         } else {
-            std::cout << "[tcp] RTSP stream ready — listening on 0.0.0.0:" << port_ << "\n";
+            std::cout << "[tcp] Stream ready — listening on 0.0.0.0:" << port_ << "\n";
         }
 
         while (true) {
@@ -1023,9 +1168,6 @@ private:
         std::fclose(fp);
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-
-    /** Build a response string from key=value pairs + trailing blank line. */
     static std::string ok(std::initializer_list<std::pair<std::string,std::string>> kv)
     {
         std::string out = "ok=true\n";
@@ -1039,16 +1181,12 @@ private:
         return "ok=false\nerror=" + msg + "\n\n";
     }
 
-    // ── dispatcher ────────────────────────────────────────────────────────────
-
     std::string dispatch(const char* raw)
     {
-        // Tokenise: first word is the command, rest is the argument
         std::string line(raw);
-        auto sp     = line.find(' ');
+        auto sp  = line.find(' ');
         std::string cmd = (sp == std::string::npos) ? line : line.substr(0, sp);
         std::string arg = (sp == std::string::npos) ? "" : line.substr(sp + 1);
-        // trim arg
         while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t')) arg.pop_back();
 
         if (cmd == "start") {
@@ -1080,7 +1218,6 @@ private:
             for (auto& entry : fs::directory_iterator(rec_.dir(), ec)) {
                 if (entry.is_directory()) continue;
                 auto sz = entry.file_size(ec);
-                // C++17-compatible file time → wall clock via time_t from stat
                 struct stat st{};
                 TP modTime = Clock::now();
                 if (::stat(entry.path().c_str(), &st) == 0)
@@ -1106,9 +1243,9 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
-    // Force unbuffered output so every log line reaches journald immediately
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
+
     // ── 0. Pin this process to CPU core 2 ────────────────────────────────────
     {
         cpu_set_t cpuset;
@@ -1142,46 +1279,47 @@ int main(int argc, char* argv[])
 
     // ── 3. CLI flags override config values ──────────────────────────────────
     for (int i = 1; i < argc; ++i) {
-        if      (std::string(argv[i]) == "--rtsp"   && i + 1 < argc) cfg.rtspURL  = argv[++i];
-        else if (std::string(argv[i]) == "--dir"    && i + 1 < argc) cfg.dir      = argv[++i];
-        else if (std::string(argv[i]) == "--port"   && i + 1 < argc) cfg.port     = std::stoi(argv[++i]);
-        else if (std::string(argv[i]) == "--pre"    && i + 1 < argc) cfg.preSecs  = std::stod(argv[++i]);
-        else if (std::string(argv[i]) == "--post"   && i + 1 < argc) cfg.postSecs = std::stod(argv[++i]);
-        else if (std::string(argv[i]) == "--config" && i + 1 < argc) ++i;
+        if      (std::string(argv[i]) == "--raw-host"   && i+1 < argc) cfg.rawHost   = argv[++i];
+        else if (std::string(argv[i]) == "--raw-port"   && i+1 < argc) cfg.rawPort   = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--raw-width"  && i+1 < argc) cfg.rawWidth  = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--raw-height" && i+1 < argc) cfg.rawHeight = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--raw-fps"    && i+1 < argc) cfg.rawFps    = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--raw-stride" && i+1 < argc) cfg.rawStride = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--dir"        && i+1 < argc) cfg.dir       = argv[++i];
+        else if (std::string(argv[i]) == "--port"       && i+1 < argc) cfg.port      = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--pre"        && i+1 < argc) cfg.preSecs   = std::stod(argv[++i]);
+        else if (std::string(argv[i]) == "--post"       && i+1 < argc) cfg.postSecs  = std::stod(argv[++i]);
+        else if (std::string(argv[i]) == "--config"     && i+1 < argc) ++i;
     }
 
     // ── 4. Start ──────────────────────────────────────────────────────────────
-    // Install a custom FFmpeg log callback that suppresses H.264 decoder
-    // warnings (PPS/SPS reference errors, decode_slice_header, no frame).
-    // These are emitted by the demuxer's internal probe decoder and are
-    // harmless — we are muxing, not decoding.
     av_log_set_callback([](void* avcl, int level, const char* fmt, va_list vl) {
-        if (level > AV_LOG_WARNING) return;          // drop debug/verbose/info
-        // Suppress known H.264 decoder noise
+        if (level > AV_LOG_WARNING) return;
         const char* noisy[] = {
-            "non-existing PPS",
-            "decode_slice_header error",
-            "no frame!",
-            "non-existing SPS",
-            nullptr
+            "non-existing PPS", "decode_slice_header error",
+            "no frame!", "non-existing SPS", nullptr
         };
         for (const char** p = noisy; *p; ++p)
             if (std::strstr(fmt, *p)) return;
-        // Pass everything else through to the default handler
         av_log_default_callback(avcl, level, fmt, vl);
     });
 
-    std::cout << "[main] RTSP source:  " << cfg.rtspURL      << "\n"
-              << "[main] Recordings:   " << cfg.dir          << "\n"
-              << "[main] Pre-buffer:   " << cfg.preSecs      << "s\n"
-              << "[main] Post-buffer:  " << cfg.postSecs     << "s\n"
+    int effectiveStride = cfg.rawStride > 0 ? cfg.rawStride : cfg.rawWidth;
+    std::cout << "[main] Raw source:   " << cfg.rawHost << ":" << cfg.rawPort << "\n"
+              << "[main] Frame size:   " << cfg.rawWidth << "x" << cfg.rawHeight
+              << "  stride=" << effectiveStride << "  fps=" << cfg.rawFps << "\n"
+              << "[main] Recordings:   " << cfg.dir     << "\n"
+              << "[main] Pre-buffer:   " << cfg.preSecs << "s\n"
+              << "[main] Post-buffer:  " << cfg.postSecs << "s\n"
               << "[main] Control TCP:  0.0.0.0:" << cfg.port << "\n"
               << "[main]   echo 'start 111-222-333' | nc 127.0.0.1 " << cfg.port << "\n"
               << "[main]   echo 'stop'              | nc 127.0.0.1 " << cfg.port << "\n"
               << "[main]   echo 'status'            | nc 127.0.0.1 " << cfg.port << "\n"
               << "[main]   echo 'list'              | nc 127.0.0.1 " << cfg.port << "\n";
 
-    Recorder rec(cfg.rtspURL, cfg.dir, cfg.preSecs, cfg.postSecs);
+    Recorder rec(cfg.rawHost, cfg.rawPort,
+                 cfg.rawWidth, cfg.rawHeight, cfg.rawFps, cfg.rawStride,
+                 cfg.dir, cfg.preSecs, cfg.postSecs);
     Server   srv(rec, cfg.port);
     srv.run();
 
