@@ -25,6 +25,7 @@ binary-arch: build
 
 	install -m 0755 picam-recorder \
 	    debian/tmp/usr/local/bin/picam-recorder
+	strip --strip-unneeded debian/tmp/usr/local/bin/picam-recorder
 	install -m 0644 src/main.cpp \
 	    debian/tmp/usr/share/picam-recorder/src/main.cpp
 	install -m 0644 debian/recorder.ini \
