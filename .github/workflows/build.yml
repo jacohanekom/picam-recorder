@@ -16,16 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # picam-recorder doesn't use debhelper (no `dh $@` in debian/rules,
-      # no debhelper-compat Build-Dep) — it hand-rolls binary/binary-arch
-      # targets and calls dpkg-deb directly, so dpkg-dev (not debhelper)
-      # is what actually provides dpkg-buildpackage here.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential dpkg-dev devscripts reprepro gnupg \
-            g++ pkg-config libavformat-dev libavcodec-dev libavutil-dev \
+            build-essential debhelper devscripts reprepro gnupg \
+            pkg-config libavformat-dev libavcodec-dev libavutil-dev \
             curl ca-certificates unzip
 
       - name: Install AWS CLI
@@ -47,14 +43,6 @@ jobs:
             echo "codename=nightly" >> "$GITHUB_OUTPUT"
           fi
 
-      # The packaged Version: field is NOT derived from debian/changelog
-      # here — it's hardcoded in debian/control.binary, which
-      # binary-arch copies verbatim into the .deb. So the version has to
-      # be stamped in BOTH places: dch (for the documented record, and
-      # because dpkg-buildpackage still reads changelog for the source
-      # version in .changes/.buildinfo) AND a sed on control.binary's
-      # Version: line (what actually ends up in the shipped package) —
-      # see debian/rules and Dockerfile.native-arm64 for the full story.
       - name: Stamp build-time version for nightly builds
         if: ${{ steps.dist.outputs.codename == 'nightly' }}
         env:
@@ -63,10 +51,8 @@ jobs:
         run: |
           BASEVER="$(dpkg-parsechangelog -S Version | sed -E 's/\+.*//')"
           TS="$(date -u +%Y%m%d%H%M%S)"
-          NEWVER="${BASEVER}+${TS}"
-          dch --newversion "${NEWVER}" --distribution stable --force-distribution \
+          dch --newversion "${BASEVER}+${TS}" --distribution stable --force-distribution \
             "Automated CI build (UTC ${TS})."
-          sed -i "s/^Version: .*/Version: ${NEWVER}/" debian/control.binary
 
       - name: Build package
         run: dpkg-buildpackage -us -uc -b

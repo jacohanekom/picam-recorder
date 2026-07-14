@@ -2,12 +2,13 @@ Source: picam-recorder
 Section: video
 Priority: optional
 Maintainer: Jaco Hanekom <jhanekom@gmail.com>
-Build-Depends: g++, libavformat-dev, libavcodec-dev, libavutil-dev, pkg-config
-Standards-Version: 4.6.0
+Build-Depends: debhelper-compat (= 13), pkg-config, libavformat-dev, libavcodec-dev, libavutil-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
 
 Package: picam-recorder
 Architecture: any
-Depends: libavcodec59 (>= 7:5.0), libavformat59 (>= 7:5.0), libavutil57 (>= 7:5.0), libc6 (>= 2.34), libgcc-s1 (>= 3.0), libstdc++6 (>= 12)
+Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: RTSP stream recorder with pre/post buffer
  Records H.264 RTSP streams to MP4 files with configurable pre-roll
  and post-roll buffers. Controlled via a TCP plain-text protocol.

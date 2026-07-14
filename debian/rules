@@ -1,58 +1,16 @@
 #!/usr/bin/make -f
+%:
+	dh $@
 
-VERSION  := $(shell dpkg-parsechangelog -SVersion)
-ARCH     := $(shell dpkg --print-architecture)
-DEBFILE  := picam-recorder_$(VERSION)_$(ARCH).deb
+override_dh_auto_build:
+	$(MAKE)
 
-build:
-	g++ -std=c++17 -O2 -pthread \
-	    src/main.cpp \
-	    $(shell pkg-config --cflags --libs libavformat libavcodec libavutil) \
-	    -o picam-recorder
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/picam-recorder
 
-binary: binary-arch
-binary-indep:
+override_dh_installsystemd:
+	dh_installsystemd --no-restart-on-upgrade --no-stop-on-upgrade
 
-binary-arch: build
-	rm -rf debian/tmp
-	install -d debian/tmp/DEBIAN
-	install -d debian/tmp/usr/local/bin
-	install -d debian/tmp/usr/share/picam-recorder/src
-	install -d debian/tmp/usr/share/doc/picam-recorder
-	install -d debian/tmp/etc/picam-recorder
-	install -d debian/tmp/lib/systemd/system
-	install -d debian/tmp/var/lib/picam-recorder
-
-	install -m 0755 picam-recorder \
-	    debian/tmp/usr/local/bin/picam-recorder
-	strip --strip-unneeded debian/tmp/usr/local/bin/picam-recorder
-	install -m 0644 src/main.cpp \
-	    debian/tmp/usr/share/picam-recorder/src/main.cpp
-	install -m 0644 debian/recorder.ini \
-	    debian/tmp/etc/picam-recorder/recorder.ini
-	install -m 0644 debian/picam-recorder.service \
-	    debian/tmp/lib/systemd/system/picam-recorder.service
-	install -m 0644 debian/copyright \
-	    debian/tmp/usr/share/doc/picam-recorder/copyright
-	install -m 0644 debian/changelog \
-	    debian/tmp/usr/share/doc/picam-recorder/changelog
-	gzip -9 -n debian/tmp/usr/share/doc/picam-recorder/changelog
-
-	install -m 0755 debian/postinst  debian/tmp/DEBIAN/postinst
-	install -m 0755 debian/prerm     debian/tmp/DEBIAN/prerm
-	install -m 0755 debian/postrm    debian/tmp/DEBIAN/postrm
-	install -m 0644 debian/conffiles debian/tmp/DEBIAN/conffiles
-
-	cd debian/tmp && find . -type f ! -path './DEBIAN/*' \
-	    -exec md5sum {} \; > DEBIAN/md5sums
-
-	install -m 0644 debian/control.binary debian/tmp/DEBIAN/control
-
-	dpkg-deb --build --root-owner-group debian/tmp \
-	    ../$(DEBFILE)
-	dpkg-distaddfile $(DEBFILE) video optional
-
-clean:
+override_dh_auto_clean:
+	dh_auto_clean
 	rm -f picam-recorder
-	rm -rf debian/tmp
-	rm -f debian/files

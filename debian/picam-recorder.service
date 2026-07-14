@@ -3,7 +3,7 @@ Description=PiCam Recorder
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/picam-recorder --config /etc/picam-recorder/recorder.ini
+ExecStart=/usr/bin/picam-recorder --config /etc/picam-recorder/recorder.ini
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

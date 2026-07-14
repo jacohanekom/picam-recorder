@@ -5,23 +5,13 @@
 # picam-orchestrator-go/picam-frontend-go/mp3-player/pi-fan-control
 # projects' Dockerfile.native-arm64.
 #
-# Every build dependency here (g++, pkg-config, libavformat-dev,
+# Every build dependency here (pkg-config, libavformat-dev,
 # libavcodec-dev, libavutil-dev) is a plain Debian package — no
 # Raspberry Pi-specific repo needed.
 #
-# Unlike every other project in this repo, picam-recorder's debian/rules
-# does NOT use debhelper (no `dh $@`, no debhelper-compat in
-# Build-Depends) — it hand-rolls `build`/`binary`/`binary-arch`/`clean`
-# targets and calls dpkg-deb directly. More importantly, the packaged
-# Version: field is NOT derived from debian/changelog at all — it's
-# hardcoded in a separate debian/control.binary, which
-# `binary-arch` copies verbatim into the .deb. So stamping a fresh
-# build-time version here means updating BOTH files: debian/changelog
-# (via dch, for a documented record, and because dpkg-buildpackage still
-# reads it for the source version in .changes/.buildinfo) AND
-# debian/control.binary's Version: line (via sed, since that's what
-# actually ends up in the shipped package) — dch alone would silently
-# have no effect on the real output.
+# Standard debhelper build (debhelper-compat in Build-Depends,
+# `dh $@` in debian/rules) — the packaged Version: comes from
+# debian/changelog like every other project here.
 #
 # Usage (from this directory, on a genuinely arm64 Docker host):
 #   docker build --platform linux/arm64 -f Dockerfile.native-arm64 -t picam-recorder-builder .
@@ -33,9 +23,8 @@ FROM debian:bookworm-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
-        dpkg-dev \
+        debhelper \
         devscripts \
-        g++ \
         pkg-config \
         libavformat-dev \
         libavcodec-dev \
@@ -47,9 +36,7 @@ COPY . .
 
 # Stamp a build-time version (base version + UTC date/time as a Debian
 # local-version suffix — see picam-orchestrator-go/Dockerfile.native-arm64
-# for the general rationale; see this file's header above for why it also
-# needs updating debian/control.binary, not just the changelog, for this
-# particular project). No "-1" revision suffix, matching this project's
+# for the rationale). No "-1" revision suffix, matching this project's
 # own checked-in convention (1.0.0+202606031613, no trailing "-N").
 # Timestamp is a plain contiguous digit run (YYYYMMDDHHMMSS, no
 # separator): dpkg compares maximal digit runs as arbitrary-precision
@@ -59,11 +46,9 @@ COPY . .
 RUN set -e; \
     BASEVER="$(dpkg-parsechangelog -S Version | sed -E 's/\+.*//')"; \
     TS="$(date -u +%Y%m%d%H%M%S)"; \
-    NEWVER="${BASEVER}+${TS}"; \
     DEBEMAIL="jhanekom@gmail.com" DEBFULLNAME="Jaco Hanekom" \
-        dch --newversion "${NEWVER}" --distribution stable --force-distribution \
+        dch --newversion "${BASEVER}+${TS}" --distribution stable --force-distribution \
         "Automated native arm64 build (UTC ${TS})."; \
-    sed -i "s/^Version: .*/Version: ${NEWVER}/" debian/control.binary; \
     dpkg-buildpackage -us -uc -b
 
 # Build artifacts land one directory above the source tree by default.

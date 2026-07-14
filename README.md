@@ -34,7 +34,7 @@ Installs to:
 
 | Path | Contents |
 |------|----------|
-| `/usr/local/bin/picam-recorder` | Binary |
+| `/usr/bin/picam-recorder` | Binary |
 | `/etc/picam-recorder/recorder.ini` | Config file |
 | `/lib/systemd/system/picam-recorder.service` | Systemd unit |
 | `/var/lib/picam-recorder/` | Recording output directory |
@@ -42,7 +42,7 @@ Installs to:
 ### Debian package
 
 ```bash
-dpkg-buildpackage -us -uc -F
+dpkg-buildpackage -us -uc -b
 sudo dpkg -i ../picam-recorder_*_arm64.deb
 ```
 

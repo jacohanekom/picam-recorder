@@ -1,6 +1,6 @@
 #!/bin/sh
 set -e
-systemctl daemon-reload || true
+#DEBHELPER#
 echo ""
 echo "picam-recorder installed."
 echo "  recorder config : /etc/picam-recorder/recorder.ini"
