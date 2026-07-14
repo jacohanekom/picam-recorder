@@ -90,10 +90,12 @@ jobs:
         run: |
           ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           LOCK_ID="${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          LOCK_FILE=$(mktemp)
+          printf '%s' "$LOCK_ID" > "$LOCK_FILE"
           ELAPSED=0
           MAX_WAIT=600
           while ! aws s3api put-object --bucket "${R2_BUCKET}" --key _lock \
-              --body <(printf '%s' "$LOCK_ID") --if-none-match '*' \
+              --body "$LOCK_FILE" --if-none-match '*' \
               --endpoint-url "$ENDPOINT" >/dev/null 2>&1; do
             if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
               echo "Breaking stale publish lock after ${MAX_WAIT}s"
@@ -105,6 +107,7 @@ jobs:
             sleep 5
             ELAPSED=$((ELAPSED + 5))
           done
+          rm -f "$LOCK_FILE"
           echo "Lock acquired: $LOCK_ID"
 
       - name: Fetch existing repo state from R2
