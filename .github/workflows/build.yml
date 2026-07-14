@@ -146,6 +146,28 @@ jobs:
             --endpoint-url "$ENDPOINT" \
             --cache-control "no-cache, must-revalidate"
 
+      # Cloudflare doesn't reliably honor the origin's Cache-Control on
+      # this zone (confirmed: it substitutes its own ~4h edge TTL even
+      # on a fresh MISS), so the no-cache headers above aren't enough on
+      # their own -- an explicit purge after every publish is what
+      # actually keeps apt clients from seeing a stale Packages/Release.
+      - name: Purge Cloudflare cache for repo metadata
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"files": [
+              "https://apt.aipicam.com/dists/${{ steps.dist.outputs.codename }}/InRelease",
+              "https://apt.aipicam.com/dists/${{ steps.dist.outputs.codename }}/Release",
+              "https://apt.aipicam.com/dists/${{ steps.dist.outputs.codename }}/Release.gpg",
+              "https://apt.aipicam.com/dists/${{ steps.dist.outputs.codename }}/main/binary-arm64/Packages",
+              "https://apt.aipicam.com/dists/${{ steps.dist.outputs.codename }}/main/binary-arm64/Packages.gz",
+              "https://apt.aipicam.com/dists/${{ steps.dist.outputs.codename }}/main/binary-armhf/Packages",
+              "https://apt.aipicam.com/dists/${{ steps.dist.outputs.codename }}/main/binary-armhf/Packages.gz",
+              "https://apt.aipicam.com/pubkey.asc"
+            ]}' \
+            "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache"
+
       - name: Release R2 publish lock
         if: always()
         env:
