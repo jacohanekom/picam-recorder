@@ -125,14 +125,26 @@ jobs:
       - name: Export public key
         run: gpg --export --armor "${{ secrets.GPG_KEY_ID }}" > apt-repo/pubkey.asc
 
+      # dists/* (Packages/Release/InRelease) and pubkey.asc change on
+      # every publish, so apt clients must always revalidate rather than
+      # serve a stale Cloudflare-cached copy -- R2 doesn't auto-purge the
+      # CDN cache on overwrite. pool/*.deb filenames are unique per
+      # version, so those are left cacheable normally.
       - name: Publish repo to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
+          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           aws s3 sync apt-repo "s3://${R2_BUCKET}" \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
-            --exclude "conf/*" --delete
+            --endpoint-url "$ENDPOINT" \
+            --exclude "conf/*" --exclude "dists/*" --exclude "pubkey.asc" --delete
+          aws s3 sync apt-repo/dists "s3://${R2_BUCKET}/dists" \
+            --endpoint-url "$ENDPOINT" \
+            --cache-control "no-cache, must-revalidate" --delete
+          aws s3 cp apt-repo/pubkey.asc "s3://${R2_BUCKET}/pubkey.asc" \
+            --endpoint-url "$ENDPOINT" \
+            --cache-control "no-cache, must-revalidate"
 
       - name: Release R2 publish lock
         if: always()
