@@ -1,0 +1,116 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-deb:
+    # Genuinely arm64 hardware (no QEMU), matching the sibling projects'
+    # Dockerfile.native-arm64 approach.
+    runs-on: ubuntu-24.04-arm
+    env:
+      R2_BUCKET: aipicam-test-packages
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      # picam-recorder doesn't use debhelper (no `dh $@` in debian/rules,
+      # no debhelper-compat Build-Dep) — it hand-rolls binary/binary-arch
+      # targets and calls dpkg-deb directly, so dpkg-dev (not debhelper)
+      # is what actually provides dpkg-buildpackage here.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential dpkg-dev devscripts reprepro gnupg \
+            g++ pkg-config libavformat-dev libavcodec-dev libavutil-dev \
+            curl ca-certificates unzip
+
+      - name: Install AWS CLI
+        run: |
+          if command -v aws >/dev/null 2>&1; then
+            echo "AWS CLI already present: $(aws --version)"
+          else
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+          fi
+
+      - name: Determine target apt distribution
+        id: dist
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "codename=main" >> "$GITHUB_OUTPUT"
+          else
+            echo "codename=nightly" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The packaged Version: field is NOT derived from debian/changelog
+      # here — it's hardcoded in debian/control.binary, which
+      # binary-arch copies verbatim into the .deb. So the version has to
+      # be stamped in BOTH places: dch (for the documented record, and
+      # because dpkg-buildpackage still reads changelog for the source
+      # version in .changes/.buildinfo) AND a sed on control.binary's
+      # Version: line (what actually ends up in the shipped package) —
+      # see debian/rules and Dockerfile.native-arm64 for the full story.
+      - name: Stamp build-time version for nightly builds
+        if: ${{ steps.dist.outputs.codename == 'nightly' }}
+        env:
+          DEBEMAIL: jhanekom@gmail.com
+          DEBFULLNAME: Jaco Hanekom
+        run: |
+          BASEVER="$(dpkg-parsechangelog -S Version | sed -E 's/\+.*//')"
+          TS="$(date -u +%Y%m%d%H%M%S)"
+          NEWVER="${BASEVER}+${TS}"
+          dch --newversion "${NEWVER}" --distribution stable --force-distribution \
+            "Automated CI build (UTC ${TS})."
+          sed -i "s/^Version: .*/Version: ${NEWVER}/" debian/control.binary
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Collect build artifacts
+        run: |
+          mkdir dist
+          cp ../*.deb ../*.changes ../*.buildinfo dist/
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picam-recorder-deb
+          path: dist/*
+
+      - name: Import GPG signing key
+        run: printf '%s' "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+      - name: Render reprepro config
+        run: |
+          mkdir -p apt-repo/conf
+          sed "s/__GPG_KEY_ID__/${{ secrets.GPG_KEY_ID }}/" \
+            .github/reprepro/distributions.tmpl > apt-repo/conf/distributions
+
+      - name: Fetch existing repo state from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 sync "s3://${R2_BUCKET}" apt-repo \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --exclude "conf/*"
+
+      - name: Add package to repo
+        run: reprepro -b apt-repo includedeb ${{ steps.dist.outputs.codename }} dist/*.deb
+
+      - name: Export public key
+        run: gpg --export --armor "${{ secrets.GPG_KEY_ID }}" > apt-repo/pubkey.asc
+
+      - name: Publish repo to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 sync apt-repo "s3://${R2_BUCKET}" \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --exclude "conf/*" --delete
