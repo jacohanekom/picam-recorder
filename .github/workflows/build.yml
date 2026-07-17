@@ -7,7 +7,12 @@ on:
 jobs:
   build-deb:
     # Genuinely arm64 hardware (no QEMU), matching the sibling projects'
-    # Dockerfile.native-arm64 approach.
+    # Dockerfile.native-arm64 approach. The actual compile happens inside
+    # a debian:bookworm-slim container (see "Build package" below), not
+    # on the runner's own Ubuntu 24.04 userland — Raspberry Pi OS is
+    # Debian 12 (glibc 2.36), while Ubuntu 24.04 ships glibc 2.39, so a
+    # binary linked natively on this runner fails to install on a real
+    # Pi with unmet libc6/libstdc++6 deps.
     runs-on: ubuntu-24.04-arm
     env:
       R2_BUCKET: aipicam-test-packages
@@ -16,13 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install host tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential debhelper devscripts reprepro gnupg \
-            pkg-config libavformat-dev libavcodec-dev libavutil-dev \
-            curl ca-certificates unzip
+            devscripts reprepro gnupg curl ca-certificates unzip
 
       - name: Install AWS CLI
         run: |
@@ -54,8 +57,26 @@ jobs:
           dch --newversion "${BASEVER}+${TS}" --distribution stable --force-distribution \
             "Automated CI build (UTC ${TS})."
 
+      # Compiles inside debian:bookworm-slim so the resulting binary links
+      # against the same glibc/libstdc++ as the real Pi target (see the
+      # runs-on comment above). Docker on this runner is genuine arm64
+      # hardware, so this is a native container build, not QEMU emulation.
       - name: Build package
-        run: dpkg-buildpackage -us -uc -b
+        run: |
+          PARENT_DIR="$(dirname "$GITHUB_WORKSPACE")"
+          REPO_NAME="$(basename "$GITHUB_WORKSPACE")"
+          docker run --rm \
+            -v "$PARENT_DIR:/build" \
+            -w "/build/$REPO_NAME" \
+            debian:bookworm-slim \
+            bash -c '
+              set -e
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential debhelper pkg-config \
+                libavformat-dev libavcodec-dev libavutil-dev
+              dpkg-buildpackage -us -uc -b
+            '
 
       - name: Collect build artifacts
         run: |
