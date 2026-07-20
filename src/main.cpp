@@ -102,6 +102,50 @@ struct Config {
     double      postSecs  = kDefaultPostSecs;
 };
 
+// Applies /etc/aipicam/streams.conf's [stream] main_width/main_height/
+// main_port to cfg as a baseline — picam-raw's wire protocol carries no
+// width/height field, so this process's view of the main stream's
+// geometry/port must already agree with what picam-raw actually sends.
+// aipicam-config is that single shared source of truth instead of this
+// file's own possibly-stale copy. Called before recorder.ini is parsed,
+// so recorder.ini's own explicit raw_width/raw_height/raw_port (if any)
+// still take precedence, same as CLI flags take precedence over both.
+// Silently does nothing if the shared file isn't installed.
+static void applySharedStreamDefaults(Config& cfg)
+{
+    std::ifstream f("/etc/aipicam/streams.conf");
+    if (!f) return;
+
+    auto trim = [](std::string s) -> std::string {
+        auto b = s.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) return {};
+        auto e = s.find_last_not_of(" \t\r\n");
+        return s.substr(b, e - b + 1);
+    };
+
+    std::string line, section;
+    while (std::getline(f, line)) {
+        auto hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        line = trim(line);
+        if (line.empty()) continue;
+        if (line.front() == '[' && line.back() == ']') {
+            section = trim(line.substr(1, line.size() - 2));
+            continue;
+        }
+        if (section != "stream") continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trim(line.substr(0, eq));
+        std::string val = trim(line.substr(eq + 1));
+        if (key.empty() || val.empty()) continue;
+
+        if      (key == "main_width")  cfg.rawWidth  = std::stoi(val);
+        else if (key == "main_height") cfg.rawHeight = std::stoi(val);
+        else if (key == "main_port")   cfg.rawPort   = std::stoi(val);
+    }
+}
+
 static Config loadIni(const std::string& path)
 {
     std::ifstream f(path);
@@ -109,6 +153,7 @@ static Config loadIni(const std::string& path)
         throw std::runtime_error("cannot open config file: " + path);
 
     Config cfg;
+    applySharedStreamDefaults(cfg);
     std::string line;
     int lineNo = 0;
 
@@ -1267,6 +1312,7 @@ int main(int argc, char* argv[])
 
     // ── 2. Load config file (if any) ─────────────────────────────────────────
     Config cfg;
+    applySharedStreamDefaults(cfg);
     if (!configPath.empty()) {
         try {
             cfg = loadIni(configPath);

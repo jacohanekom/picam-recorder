@@ -8,7 +8,7 @@ Rules-Requires-Root: no
 
 Package: picam-recorder
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}, aipicam-config
 Description: RTSP stream recorder with pre/post buffer
  Records H.264 RTSP streams to MP4 files with configurable pre-roll
  and post-roll buffers. Controlled via a TCP plain-text protocol.
