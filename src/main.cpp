@@ -6,10 +6,15 @@
  *      frame is JPEG-compressed -- fast, no inter-frame dependencies --
  *      and either kept in a rolling pre-buffer (no recording active)
  *      or appended to the current recording's on-disk capture file.
- *      Live H.264 encoding used to happen here instead; it couldn't
- *      reliably sustain 30fps at typical recording resolutions even
- *      after being moved off the UDP receive thread and given more CPU
- *      cores, so it was removed from this real-time path entirely.
+ *      One core's worth of JPEG encoding can't sustain 30fps at typical
+ *      recording resolutions either, so capture runs one independent
+ *      JPEG encoder per online CPU core in parallel, with their
+ *      out-of-order output reassembled back into sequence before it
+ *      reaches the pre-buffer or capture file. Live H.264 encoding used
+ *      to happen here instead of JPEG; it couldn't reliably sustain
+ *      30fps even after being moved off the UDP receive thread and
+ *      given more CPU cores, so it was removed from this real-time path
+ *      entirely.
  *   2. Transcode (batch, once a recording finishes): the capture file
  *      is read back, JPEG-decoded, and encoded to H.264 with FFmpeg
  *      (libx264), then muxed into the final MP4 -- with no real-time
@@ -78,8 +83,10 @@ extern "C" {
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -114,6 +121,14 @@ using SwsContextPtr     = std::unique_ptr<SwsContext, SwsContextDeleter>;
 static constexpr int    kDefaultPort     = 8080;
 static constexpr double kDefaultPreSecs  = 10.0;
 static constexpr double kDefaultPostSecs = 10.0;
+
+// Number of CPUs actually online right now (never below 1) -- used to
+// size the JPEG capture worker pool and CPU-affinity masks.
+static long onlineCpuCount()
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n < 1 ? 1 : n;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config  — INI / key=value file + CLI override
@@ -783,11 +798,10 @@ private:
 // as "[raw] Dropped incomplete frame" once enough reassembly slots
 // filled up with frames that could now never complete. The receive
 // loop's only job per frame is now to push the raw YUV into this
-// queue, which is fast enough to never be the bottleneck; a separate
-// thread (captureLoop) drains it and does the actual (slower) JPEG
-// compression at whatever pace it can sustain -- JPEG has no
-// inter-frame dependencies and is fast enough that this should now
-// rarely, if ever, need to actually drop anything.
+// queue, which is fast enough to never be the bottleneck; a pool of
+// capture worker threads (see captureWorkerLoop) drains it in parallel
+// and does the actual (slower) JPEG compression at whatever pace it
+// can collectively sustain.
 // ─────────────────────────────────────────────────────────────────────────────
 struct RawFrame {
     std::vector<uint8_t> yuv;
@@ -842,6 +856,75 @@ private:
     std::deque<RawFrame>    frames_;
     size_t                  maxSize_;
     uint64_t                dropped_ = 0;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JpegReorderBuffer
+//
+// A single core's worth of MJPEG encoding can't keep up with 30fps at
+// typical capture resolutions either (the same throughput problem that
+// forced live H.264 encoding off the real-time path in the first
+// place), so capture runs one independent JPEG encoder per online CPU
+// core in parallel -- see captureWorkerLoop. That means frames finish
+// out of frameSeq order: whichever worker happens to grab the shortest
+// straw publishes first. Everything downstream (the capture file,
+// which is read back sequentially and assumes strictly increasing
+// timestamps for DTS pacing, and the rolling pre-buffer) needs frames
+// delivered in strict frameSeq order, so this buffers early arrivals
+// and releases them once the gap in front of them closes.
+//
+// frameSeq can also have genuine, permanent gaps: FrameQueue itself
+// drops the oldest queued frame under sustained backpressure, so the
+// "next" sequence number this is waiting for may simply never arrive.
+// Rather than stall forever, once more than maxWindow frames are held
+// pending, the lowest-numbered one is released anyway and the gap is
+// skipped over.
+// ─────────────────────────────────────────────────────────────────────────────
+class JpegReorderBuffer {
+public:
+    using Ready = std::function<void(std::vector<uint8_t>, int64_t, uint32_t)>;
+
+    JpegReorderBuffer(size_t maxWindow, Ready onReady)
+        : maxWindow_(maxWindow), onReady_(std::move(onReady)) {}
+
+    void submit(std::vector<uint8_t> jpeg, int64_t timestampUs, uint32_t frameSeq)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!started_) { next_ = frameSeq; started_ = true; }
+
+        // Wraparound-safe "frameSeq is older than what we already
+        // released" check -- a straggler from a worker that finished
+        // very late, after a skip-ahead already passed it by.
+        if (static_cast<int32_t>(frameSeq - next_) < 0) return;
+
+        pending_.emplace(frameSeq, Item{ std::move(jpeg), timestampUs });
+
+        while (!pending_.empty()) {
+            auto it = pending_.begin();
+            bool isNext   = (it->first == next_);
+            bool mustSkip = (pending_.size() > maxWindow_);
+            if (!isNext && !mustSkip) break;
+
+            uint32_t seq = it->first;
+            Item     item = std::move(it->second);
+            pending_.erase(it);
+            next_ = seq + 1;
+            onReady_(std::move(item.jpeg), item.timestampUs, seq);
+        }
+    }
+
+private:
+    struct Item {
+        std::vector<uint8_t> jpeg;
+        int64_t               timestampUs;
+    };
+
+    std::mutex               mu_;
+    std::map<uint32_t, Item> pending_;
+    size_t                   maxWindow_;
+    Ready                    onReady_;
+    uint32_t                 next_    = 0;
+    bool                     started_ = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -925,12 +1008,18 @@ public:
         , postBufferSecs_(postBufferSecs)
         // ~2s of headroom at the configured frame rate -- a safety net
         // for a brief capture stall, not a substitute for JPEG capture
-        // actually keeping up on average (which it should, easily --
-        // see FrameQueue's own comment).
+        // actually keeping up on average (which it should, given the
+        // worker pool below -- see FrameQueue's own comment).
         , frameQueue_(static_cast<size_t>(std::max(rawFps * 2, 30)))
+        , numCaptureWorkers_(static_cast<int>(onlineCpuCount()))
+        , reorder_(static_cast<size_t>(numCaptureWorkers_) * 2,
+                   [this](std::vector<uint8_t> jpeg, int64_t ts, uint32_t seq) {
+                       publishCapturedFrame(std::move(jpeg), ts, seq);
+                   })
     {
-        readerThread_    = std::thread([this]{ readStream(); });
-        captureThread_   = std::thread([this]{ captureLoop(); });
+        readerThread_ = std::thread([this]{ readStream(); });
+        for (int i = 0; i < numCaptureWorkers_; ++i)
+            captureThreads_.emplace_back([this, i]{ captureWorkerLoop(i); });
         transcodeThread_ = std::thread([this]{ transcodeLoop(); });
         drainThread_     = std::thread([this]{ drainLoop(); });
     }
@@ -943,7 +1032,7 @@ public:
         transcodeQueue_.wake();
         if (drainThread_.joinable())     drainThread_.join();
         if (readerThread_.joinable())    readerThread_.join();
-        if (captureThread_.joinable())   captureThread_.join();
+        for (auto& t : captureThreads_) if (t.joinable()) t.join();
         if (transcodeThread_.joinable()) transcodeThread_.join();
     }
 
@@ -1052,7 +1141,8 @@ public:
     bool streamReady() const { return firstFrameReady_.load(); }
 
 private:
-    // Dispatches one freshly JPEG-captured frame: always into the
+    // Dispatches one freshly JPEG-captured frame, already back in
+    // strict frameSeq order courtesy of reorder_: always into the
     // rolling pre-buffer, and additionally into the current recording's
     // capture file if one is active.
     void onCapturedFrame(std::vector<uint8_t> jpeg, int64_t timestampUs, uint32_t frameSeq)
@@ -1063,6 +1153,22 @@ private:
         if ((state_ == RecordState::Recording || state_ == RecordState::Draining) && captureWriter_)
             captureWriter_->appendFrame(jpeg, timestampUs, frameSeq);
         preBuf_.push(std::move(jpeg), timestampUs, wallTime, frameSeq);
+    }
+
+    // reorder_'s onReady callback: called synchronously, one frame at a
+    // time and always in ascending frameSeq order (see JpegReorderBuffer),
+    // so this is also the correct, single place to detect "the very
+    // first frame has now actually been published" -- unlike checking
+    // this inside a capture worker directly, which could fire based on
+    // whichever worker happened to finish its own encode first.
+    void publishCapturedFrame(std::vector<uint8_t> jpeg, int64_t timestampUs, uint32_t frameSeq)
+    {
+        onCapturedFrame(std::move(jpeg), timestampUs, frameSeq);
+
+        if (!firstFrameReady_.load()) {
+            { std::lock_guard<std::mutex> lk(firstFrameMu_); firstFrameReady_ = true; }
+            firstFrameCv_.notify_all();
+        }
     }
 
     void drainLoop()
@@ -1134,51 +1240,64 @@ private:
         }
     }
 
-    // ── JPEG capture encoder init (persistent, captureThread_ only) ──────────
-    void initJpegEncoder()
+    // A JPEG encoder plus its persistent frame/packet, entirely owned by
+    // one capture worker thread -- see captureWorkerLoop. JPEG frames
+    // have no inter-frame dependencies, so N of these can run fully
+    // independently in parallel, unlike the old single persistent H.264
+    // encoder this replaced.
+    struct JpegEncoderHandle {
+        AVCodecContextPtr ctx;
+        AVFramePtr        frame;
+        AVPacketPtr       pkt;
+    };
+
+    // ── JPEG capture encoder init (one instance per capture worker) ──────────
+    JpegEncoderHandle initJpegEncoder()
     {
+        JpegEncoderHandle h;
+
         const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!codec)
             throw std::runtime_error("MJPEG encoder not found");
 
-        jpegCtx_.reset(avcodec_alloc_context3(codec));
-        if (!jpegCtx_)
+        h.ctx.reset(avcodec_alloc_context3(codec));
+        if (!h.ctx)
             throw std::runtime_error("avcodec_alloc_context3 (mjpeg) failed");
 
-        jpegCtx_->width          = rawWidth_;
-        jpegCtx_->height         = rawHeight_;
-        jpegCtx_->time_base      = { 1, rawFps_ };
-        jpegCtx_->pix_fmt        = AV_PIX_FMT_YUVJ420P; // MJPEG's native full-range format
+        h.ctx->width          = rawWidth_;
+        h.ctx->height         = rawHeight_;
+        h.ctx->time_base      = { 1, rawFps_ };
+        h.ctx->pix_fmt        = AV_PIX_FMT_YUVJ420P; // MJPEG's native full-range format
         // Quality: the mjpeg encoder honors qscale/global_quality via
         // FF_QP2LAMBDA scaling; 2-5 is visually near-lossless while
-        // still compressing far enough (~10-20x vs raw) that this can
-        // never become the bottleneck real-time H.264 encoding was.
-        jpegCtx_->flags         |= AV_CODEC_FLAG_QSCALE;
-        jpegCtx_->global_quality = 4 * FF_QP2LAMBDA;
+        // still compressing far enough (~10-20x vs raw) to keep the
+        // per-worker capture file and pre-buffer memory use reasonable.
+        h.ctx->flags         |= AV_CODEC_FLAG_QSCALE;
+        h.ctx->global_quality = 4 * FF_QP2LAMBDA;
 
-        int ret = avcodec_open2(jpegCtx_.get(), codec, nullptr);
+        int ret = avcodec_open2(h.ctx.get(), codec, nullptr);
         if (ret < 0) {
             char err[128]; av_strerror(ret, err, sizeof(err));
             throw std::runtime_error(std::string("avcodec_open2 (mjpeg): ") + err);
         }
 
-        jpegFrame_.reset(av_frame_alloc());
-        if (!jpegFrame_) throw std::runtime_error("av_frame_alloc (mjpeg) failed");
-        jpegFrame_->format = AV_PIX_FMT_YUVJ420P;
-        jpegFrame_->width  = rawWidth_;
-        jpegFrame_->height = rawHeight_;
-        if (av_frame_get_buffer(jpegFrame_.get(), 0) < 0)
+        h.frame.reset(av_frame_alloc());
+        if (!h.frame) throw std::runtime_error("av_frame_alloc (mjpeg) failed");
+        h.frame->format = AV_PIX_FMT_YUVJ420P;
+        h.frame->width  = rawWidth_;
+        h.frame->height = rawHeight_;
+        if (av_frame_get_buffer(h.frame.get(), 0) < 0)
             throw std::runtime_error("av_frame_get_buffer (mjpeg) failed");
 
-        jpegPkt_.reset(av_packet_alloc());
-        if (!jpegPkt_) throw std::runtime_error("av_packet_alloc (mjpeg) failed");
+        h.pkt.reset(av_packet_alloc());
+        if (!h.pkt) throw std::runtime_error("av_packet_alloc (mjpeg) failed");
 
-        std::cout << "[cap] JPEG capture ready: " << rawWidth_ << "x" << rawHeight_
-                  << " @" << rawFps_ << "fps  stride=" << rawStride_ << "\n";
+        return h;
     }
 
-    // ── JPEG-encode one raw YUV420 frame and dispatch it ──────────────────────
-    void captureFrame(const std::vector<uint8_t>& yuv, int64_t timestampUs, uint32_t frameSeq)
+    // ── JPEG-encode one raw YUV420 frame and submit it for reordering ────────
+    void captureFrame(JpegEncoderHandle& enc, int64_t& pts,
+                       const std::vector<uint8_t>& yuv, int64_t timestampUs, uint32_t frameSeq)
     {
         const int    uvStride = rawStride_ / 2;
         const int    uvHeight = rawHeight_ / 2;
@@ -1192,32 +1311,27 @@ private:
             return;
         }
 
-        if (av_frame_make_writable(jpegFrame_.get()) < 0) return;
+        if (av_frame_make_writable(enc.frame.get()) < 0) return;
 
         // Copy each plane row-by-row, stripping stride padding
         for (int row = 0; row < rawHeight_; ++row)
-            std::memcpy(jpegFrame_->data[0] + row * jpegFrame_->linesize[0],
+            std::memcpy(enc.frame->data[0] + row * enc.frame->linesize[0],
                         yuv.data() + row * rawStride_, rawWidth_);
         for (int row = 0; row < uvHeight; ++row)
-            std::memcpy(jpegFrame_->data[1] + row * jpegFrame_->linesize[1],
+            std::memcpy(enc.frame->data[1] + row * enc.frame->linesize[1],
                         yuv.data() + yBytes + row * uvStride, uvWidth);
         for (int row = 0; row < uvHeight; ++row)
-            std::memcpy(jpegFrame_->data[2] + row * jpegFrame_->linesize[2],
+            std::memcpy(enc.frame->data[2] + row * enc.frame->linesize[2],
                         yuv.data() + yBytes + uvBytes + row * uvStride, uvWidth);
 
-        jpegFrame_->pts = jpegPts_++;
+        enc.frame->pts = pts++;
 
-        if (avcodec_send_frame(jpegCtx_.get(), jpegFrame_.get()) < 0) return;
+        if (avcodec_send_frame(enc.ctx.get(), enc.frame.get()) < 0) return;
 
-        if (avcodec_receive_packet(jpegCtx_.get(), jpegPkt_.get()) == 0) {
-            onCapturedFrame(std::vector<uint8_t>(jpegPkt_->data, jpegPkt_->data + jpegPkt_->size),
-                            timestampUs, frameSeq);
-            av_packet_unref(jpegPkt_.get());
-
-            if (!firstFrameReady_.load()) {
-                { std::lock_guard<std::mutex> lk(firstFrameMu_); firstFrameReady_ = true; }
-                firstFrameCv_.notify_all();
-            }
+        if (avcodec_receive_packet(enc.ctx.get(), enc.pkt.get()) == 0) {
+            reorder_.submit(std::vector<uint8_t>(enc.pkt->data, enc.pkt->data + enc.pkt->size),
+                             timestampUs, frameSeq);
+            av_packet_unref(enc.pkt.get());
         }
     }
 
@@ -1361,46 +1475,59 @@ private:
         }
     }
 
-    // Drains frameQueue_ and JPEG-compresses each frame -- independent
-    // of the receive loop's own pace, see FrameQueue's comment for why
-    // these two are split across threads. Unlike H.264, JPEG has no
-    // inter-frame dependencies and needs no real-time deadline pressure
-    // relief, so unlike transcodeLoop below, this thread doesn't widen
-    // its own CPU affinity -- it stays on the reserved core along with
-    // the receive/TCP-control threads.
-    void captureLoop()
+    // One of numCaptureWorkers_ parallel consumers of frameQueue_, each
+    // with its own independent JPEG encoder -- independent of the
+    // receive loop's own pace, see FrameQueue's comment for why capture
+    // is split off from it onto separate threads in the first place.
+    // A single core's worth of MJPEG encoding turned out not to be
+    // enough to sustain 30fps either (the exact same throughput problem
+    // that forced live H.264 off the real-time path to begin with), so
+    // -- unlike the very first version of this pipeline -- capture now
+    // widens its own affinity too and runs one encoder per online core.
+    // Frames finish out of order across workers; reorder_ puts them
+    // back in sequence before anything downstream sees them.
+    void captureWorkerLoop(int workerIdx)
     {
+        widenAffinityToAllCores("[cap]");
+
+        JpegEncoderHandle enc;
         try {
-            initJpegEncoder();
+            enc = initJpegEncoder();
         } catch (const std::exception& e) {
-            std::cerr << "[cap] Encoder init failed: " << e.what() << "\n";
+            std::cerr << "[cap] Worker " << workerIdx << " encoder init failed: " << e.what() << "\n";
             return;
         }
+        std::cout << "[cap] Worker " << workerIdx << " ready: " << rawWidth_ << "x" << rawHeight_
+                  << " @" << rawFps_ << "fps  stride=" << rawStride_ << "\n";
 
+        int64_t  pts = 0;
         RawFrame f;
         while (!shutdown_) {
             if (!frameQueue_.pop(f, shutdown_)) continue; // timed out re-checking shutdown_, or woken by it
-            captureFrame(f.yuv, f.timestampUs, f.frameSeq);
+            captureFrame(enc, pts, f.yuv, f.timestampUs, f.frameSeq);
         }
     }
 
     // Widens this thread's own CPU affinity to every online core. Every
     // thread inherits main()'s core-2-only affinity mask (set before
     // any thread here existed) unless it explicitly changes its own --
-    // that's fine, intentional even, for the receive/TCP-control/
-    // capture threads, which stay lightweight and benefit from a
-    // reserved, uncontended core. This is the one thread that actually
-    // needs more: libx264 auto-detects its own internal thread count
-    // from how many CPUs are visible to the calling thread's affinity
-    // mask (av_cpu_count() reads sched_getaffinity()), so a
-    // single-core mask would silently force single-threaded encoding
-    // regardless of how many cores this Pi actually has.
+    // that's fine, intentional even, for the receive/TCP-control
+    // threads, which stay lightweight and benefit from a reserved,
+    // uncontended core. The capture workers and the transcode thread
+    // both need more: libx264 (transcode) and the mjpeg encoder
+    // (capture) both auto-detect their own internal thread count from
+    // how many CPUs are visible to the calling thread's affinity mask
+    // (av_cpu_count() reads sched_getaffinity()), so a single-core mask
+    // would silently force single-threaded encoding regardless of how
+    // many cores this Pi actually has -- and even where that internal
+    // auto-threading doesn't help, running N independent worker threads
+    // (capture) each pinned to all cores lets the kernel actually
+    // schedule them in parallel instead of stacking them onto one core.
     static void widenAffinityToAllCores(const char* logTag)
     {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
-        if (nCpus < 1) nCpus = 1;
+        long nCpus = onlineCpuCount();
         for (long i = 0; i < nCpus; ++i) CPU_SET(static_cast<int>(i), &cpuset);
         if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
             std::cerr << logTag << " Warning: failed to widen thread's CPU affinity: " << strerror(errno) << "\n";
@@ -1657,8 +1784,14 @@ private:
     double                         postBufferSecs_;
     FrameQueue                     frameQueue_; // reassembled raw frames awaiting JPEG capture -- see its own comment
 
+    // One JPEG capture worker per online CPU core, plus the buffer that
+    // re-serializes their out-of-order output -- see captureWorkerLoop
+    // and JpegReorderBuffer's own comments.
+    int                             numCaptureWorkers_;
+    JpegReorderBuffer               reorder_;
+
     std::thread                    readerThread_;
-    std::thread                    captureThread_;
+    std::vector<std::thread>       captureThreads_;
     std::thread                    transcodeThread_;
     std::thread                    drainThread_;
     std::atomic<bool>              shutdown_{ false };
@@ -1673,12 +1806,6 @@ private:
     std::mutex                     firstFrameMu_;
     std::atomic<bool>              firstFrameReady_{ false };
     std::condition_variable        firstFrameCv_;
-
-    // JPEG capture encoder (used only from captureThread_)
-    AVCodecContextPtr              jpegCtx_;
-    AVFramePtr                     jpegFrame_;
-    AVPacketPtr                    jpegPkt_;
-    int64_t                        jpegPts_ = 0;
 
     TranscodeQueue                 transcodeQueue_; // finished recordings awaiting transcode -- see its own comment
 };
