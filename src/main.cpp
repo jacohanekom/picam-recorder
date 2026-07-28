@@ -687,29 +687,51 @@ public:
                 throw std::runtime_error("stream not ready — no SPS/PPS received after 10s");
         }
 
+        fs::create_directories(dir_);
+        std::string stem    = fs::path(filename).stem().string();
+        std::string outPath = (fs::path(dir_) / (stem + ".mp4")).string();
+
+        if (fs::exists(outPath))
+            throw std::runtime_error("file already exists: " + outPath);
+
+        std::vector<uint8_t> sps, pps;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            sps = sps_;
+            pps = pps_;
+        }
 
-            fs::create_directories(dir_);
-            std::string stem    = fs::path(filename).stem().string();
-            std::string outPath = (fs::path(dir_) / (stem + ".mp4")).string();
+        // Opening the file (avformat_write_header) and flushing the
+        // pre-buffer (up to preBufferSecs_ worth of frames, each its own
+        // av_interleaved_write_frame disk write) both used to happen
+        // while holding mu_ -- the same mutex writeNALU() below needs
+        // for every single live frame, called inline from the UDP
+        // receive loop before it ever gets back around to recv() again.
+        // A long enough flush (a big pre-buffer, a slow SD card) stalled
+        // that loop long enough to overflow the kernel's UDP receive
+        // buffer and drop live incoming frames right as a recording
+        // started -- the "[raw] Dropped incomplete frame" bursts. Fixed
+        // by building the muxer and flushing the pre-buffer snapshot
+        // into a local variable first, matching the same
+        // build-outside/publish-inside-a-brief-lock pattern drainLoop
+        // already uses for close() below.
+        auto muxer = std::make_unique<MP4Muxer>(outPath, sps, pps);
 
-            if (fs::exists(outPath))
-                throw std::runtime_error("file already exists: " + outPath);
+        auto pre = preBuf_.drain();
+        std::cout << "[rec] Pre-buffer: flushing " << pre.size() << " frames\n";
+        for (auto& f : pre)
+            muxer->writeNALU(f.nalu, f.dts, f.wallTime, f.frameSeq);
 
-            muxer_    = std::make_unique<MP4Muxer>(outPath, sps_, pps_);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            muxer_    = std::move(muxer);
             current_  = outPath;
             state_    = RecordState::Recording;
             drainCmd_ = DrainCmd::Wait;
-
-            auto pre = preBuf_.drain();
-            std::cout << "[rec] Pre-buffer: flushing " << pre.size() << " frames\n";
-            for (auto& f : pre)
-                muxer_->writeNALU(f.nalu, f.dts, f.wallTime, f.frameSeq);
-
-            std::cout << "[rec] Recording started: " << outPath << "\n";
-            return outPath;
         }
+
+        std::cout << "[rec] Recording started: " << outPath << "\n";
+        return outPath;
     }
 
     std::string stop()
