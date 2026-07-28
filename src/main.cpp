@@ -56,6 +56,7 @@ extern "C" {
 }
 
 // ── stdlib ────────────────────────────────────────────────────────────────────
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -614,6 +615,76 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RawFrame / FrameQueue
+//
+// Decouples the UDP receive loop from H.264 encoding, which used to run
+// inline on the same thread: encodeFrame's x264 call (plus the eventual
+// MP4Muxer::writeNALU disk write) could take long enough that the thread
+// didn't get back around to recv() in time, overflowing the kernel's UDP
+// receive buffer and silently dropping packets -- surfacing later as
+// "[raw] Dropped incomplete frame" once enough reassembly slots filled up
+// with frames that could now never complete. The receive loop's only job
+// per frame is now to push the raw YUV into this queue, which is fast
+// enough to never be the bottleneck; a separate thread (encoderLoop)
+// drains it and does the actual (slower) encode+mux work at whatever
+// pace it can sustain.
+// ─────────────────────────────────────────────────────────────────────────────
+struct RawFrame {
+    std::vector<uint8_t> yuv;
+    int64_t              timestampUs;
+    uint32_t             frameSeq;
+};
+
+class FrameQueue {
+public:
+    // maxSize bounds memory use if the encoder falls behind for a
+    // sustained period (a genuine CPU-bound limit, not just a brief
+    // stall) -- rather than growing unbounded or blocking the producer
+    // (which would reintroduce the exact stall this queue exists to
+    // avoid), push drops the OLDEST queued frame to make room, so the
+    // encoder always works on the freshest data available.
+    explicit FrameQueue(size_t maxSize) : maxSize_(maxSize) {}
+
+    void push(RawFrame&& f)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (frames_.size() >= maxSize_) {
+            frames_.pop_front();
+            ++dropped_;
+            if (dropped_ == 1 || dropped_ % 30 == 0) {
+                std::cerr << "[enc] Encoder falling behind -- dropped "
+                          << dropped_ << " queued frame(s) so far\n";
+            }
+        }
+        frames_.push_back(std::move(f));
+        cv_.notify_one();
+    }
+
+    // Blocks until a frame is available, shutdown is requested, or a
+    // short timeout elapses (so the caller can re-check shutdown_
+    // periodically without a dedicated wake channel for it).
+    bool pop(RawFrame& out, const std::atomic<bool>& shutdown)
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait_for(lk, std::chrono::milliseconds(500),
+                     [&] { return !frames_.empty() || shutdown.load(); });
+        if (frames_.empty()) return false;
+        out = std::move(frames_.front());
+        frames_.pop_front();
+        return true;
+    }
+
+    void wake() { cv_.notify_all(); } // lets a shutdown be noticed immediately
+
+private:
+    std::mutex              mu_;
+    std::condition_variable cv_;
+    std::deque<RawFrame>    frames_;
+    size_t                  maxSize_;
+    uint64_t                dropped_ = 0;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Recorder
 // ─────────────────────────────────────────────────────────────────────────────
 enum class RecordState { Idle, Recording, Draining };
@@ -644,17 +715,24 @@ public:
         , preBuf_(preBufferSecs)
         , preBufferSecs_(preBufferSecs)
         , postBufferSecs_(postBufferSecs)
+        // ~2s of headroom at the configured frame rate -- a safety net
+        // for a brief encoder stall, not a substitute for the encoder
+        // actually keeping up on average. See FrameQueue's own comment.
+        , frameQueue_(static_cast<size_t>(std::max(rawFps * 2, 30)))
     {
-        readerThread_ = std::thread([this]{ readStream(); });
-        drainThread_  = std::thread([this]{ drainLoop(); });
+        readerThread_  = std::thread([this]{ readStream(); });
+        encoderThread_ = std::thread([this]{ encoderLoop(); });
+        drainThread_   = std::thread([this]{ drainLoop(); });
     }
 
     ~Recorder()
     {
         shutdown_ = true;
         drainCv_.notify_all();
-        if (drainThread_.joinable())  drainThread_.join();
-        if (readerThread_.joinable()) readerThread_.join();
+        frameQueue_.wake();
+        if (drainThread_.joinable())   drainThread_.join();
+        if (readerThread_.joinable())  readerThread_.join();
+        if (encoderThread_.joinable()) encoderThread_.join();
         if (encFrame_) av_frame_free(&encFrame_);
         if (encPkt_)   av_packet_free(&encPkt_);
         if (encCtx_)   avcodec_free_context(&encCtx_);
@@ -1100,7 +1178,13 @@ private:
             }
 
             if (pf.received == pf.total) {
-                // All chunks arrived — reassemble frame and encode
+                // All chunks arrived — reassemble and hand off to the
+                // encoder thread via frameQueue_ rather than encoding
+                // inline here: encodeFrame is the slow, CPU-heavy part
+                // (x264 plus the eventual MP4 disk write), and this loop
+                // needs to get back around to recv() promptly regardless
+                // of how long that takes, or incoming UDP chunks queue up
+                // in the kernel and start getting dropped.
                 std::vector<uint8_t> yuv;
                 size_t totalSize = 0;
                 for (auto& c : pf.chunks) totalSize += c.size();
@@ -1111,7 +1195,7 @@ private:
                 int64_t  ts  = pf.timestampUs;
                 uint32_t seq = frameSeq;
                 pending.erase(it);
-                encodeFrame(yuv, ts, seq);
+                frameQueue_.push(RawFrame{ std::move(yuv), ts, seq });
             }
 
             // Prune excessively old incomplete frames to cap memory use
@@ -1127,13 +1211,6 @@ private:
 
     void readStream()
     {
-        try {
-            initEncoder();
-        } catch (const std::exception& e) {
-            std::cerr << "[raw] Encoder init failed: " << e.what() << "\n";
-            return;
-        }
-
         while (!shutdown_) {
             try { connectRaw(); }
             catch (const std::exception& e) {
@@ -1141,6 +1218,25 @@ private:
             }
             if (!shutdown_)
                 std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+    }
+
+    // Drains frameQueue_ and does the actual (slower) encode+mux work,
+    // independent of the receive loop's own pace -- see FrameQueue's
+    // comment for why these two are split across threads.
+    void encoderLoop()
+    {
+        try {
+            initEncoder();
+        } catch (const std::exception& e) {
+            std::cerr << "[raw] Encoder init failed: " << e.what() << "\n";
+            return;
+        }
+
+        RawFrame f;
+        while (!shutdown_) {
+            if (!frameQueue_.pop(f, shutdown_)) continue; // timed out re-checking shutdown_, or woken by it
+            encodeFrame(f.yuv, f.timestampUs, f.frameSeq);
         }
     }
 
@@ -1160,8 +1256,10 @@ private:
     RollingBuffer             preBuf_;
     double                    preBufferSecs_;
     double                    postBufferSecs_;
+    FrameQueue                frameQueue_; // reassembled raw frames awaiting encode -- see its own comment
 
     std::thread               readerThread_;
+    std::thread               encoderThread_;
     std::thread               drainThread_;
     std::atomic<bool>         shutdown_{ false };
 
@@ -1175,7 +1273,7 @@ private:
     std::atomic<bool>         spsPpsReady_{ false };
     std::condition_variable   spsPpsCv_;
 
-    // H.264 encoder (used only from readerThread_)
+    // H.264 encoder (used only from encoderThread_)
     AVCodecContext*           encCtx_   = nullptr;
     AVFrame*                  encFrame_ = nullptr;
     AVPacket*                 encPkt_   = nullptr;
