@@ -554,15 +554,30 @@ public:
 
         uint64_t normDTS = accumDTS_;
 
-        static const uint8_t kStartCode[4] = {0x00, 0x00, 0x00, 0x01};
-        std::vector<uint8_t> annexb;
-        annexb.reserve(4 + nalu.size());
-        annexb.insert(annexb.end(), kStartCode, kStartCode + 4);
-        annexb.insert(annexb.end(), nalu.begin(), nalu.end());
+        // The extradata built in the constructor declares AVCC format
+        // with lengthSizeMinusOne = 3 (4-byte length-prefixed samples,
+        // per ISO/IEC 14496-15) -- so each sample written here must be
+        // prefixed with its own big-endian 4-byte length, NOT an
+        // Annex-B start code. Writing a start code instead (as this
+        // used to) leaves the moov/extradata correctly declaring AVCC
+        // while every sample's payload is actually Annex-B: any
+        // strict demuxer reads the first 4 bytes of a sample as a
+        // length, gets "1" from the 00 00 00 01 start code, and
+        // desyncs from there -- the container is well-formed but the
+        // bitstream inside it is garbage, so the file fails to play
+        // almost everywhere except a few very lenient players.
+        std::vector<uint8_t> avcc;
+        avcc.reserve(4 + nalu.size());
+        const uint32_t naluLen = static_cast<uint32_t>(nalu.size());
+        avcc.push_back(static_cast<uint8_t>((naluLen >> 24) & 0xff));
+        avcc.push_back(static_cast<uint8_t>((naluLen >> 16) & 0xff));
+        avcc.push_back(static_cast<uint8_t>((naluLen >> 8)  & 0xff));
+        avcc.push_back(static_cast<uint8_t>( naluLen        & 0xff));
+        avcc.insert(avcc.end(), nalu.begin(), nalu.end());
 
         av_packet_unref(pkt_);
-        pkt_->data         = annexb.data();
-        pkt_->size         = static_cast<int>(annexb.size());
+        pkt_->data         = avcc.data();
+        pkt_->size         = static_cast<int>(avcc.size());
         pkt_->stream_index = stream_->index;
         pkt_->pts          = static_cast<int64_t>(normDTS);
         pkt_->dts          = static_cast<int64_t>(normDTS);
