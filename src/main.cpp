@@ -1226,6 +1226,35 @@ private:
     // comment for why these two are split across threads.
     void encoderLoop()
     {
+        // Every thread inherits main()'s core-2-only affinity mask (set
+        // before any thread here existed) unless it explicitly changes
+        // its own. That's fine -- intentional, even -- for the receive/
+        // TCP-control threads, which stay lightweight and benefit from
+        // a reserved, uncontended core. But libx264 auto-detects its
+        // OWN internal thread count from how many CPUs are visible to
+        // the calling thread's affinity mask (av_cpu_count() reads
+        // sched_getaffinity()), so encoding was silently forced
+        // single-threaded regardless of how many cores this Pi
+        // actually has -- and single-threaded x264, even at
+        // "ultrafast", isn't fast enough to keep up with 30fps at this
+        // resolution on one core, which is what was actually causing
+        // "[enc] Encoder falling behind" (a genuine CPU-bound limit,
+        // not a scheduling/stall problem -- that part was already
+        // fixed by moving encoding off the receive thread). Widen just
+        // this thread's mask to every online CPU so the encoder can
+        // actually use them.
+        {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
+            if (nCpus < 1) nCpus = 1;
+            for (long i = 0; i < nCpus; ++i) CPU_SET(static_cast<int>(i), &cpuset);
+            if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
+                std::cerr << "[enc] Warning: failed to widen encoder thread's CPU affinity: " << strerror(errno) << "\n";
+            else
+                std::cout << "[enc] Encoder thread using up to " << nCpus << " CPU(s)\n";
+        }
+
         try {
             initEncoder();
         } catch (const std::exception& e) {
