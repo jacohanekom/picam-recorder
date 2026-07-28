@@ -1,34 +1,28 @@
 /**
- * picam_recorder — records raw YUV420 frames from picam-raw UDP stream to MP4
+ * picam_recorder — records raw YUV420 frames from picam-raw UDP stream to AVI
  *
- * Two-phase pipeline:
- *   1. Capture (real-time, must never fall behind): each raw YUV420
- *      frame is JPEG-compressed -- fast, no inter-frame dependencies --
- *      and either kept in a rolling pre-buffer (no recording active)
- *      or appended to the current recording's on-disk capture file.
- *      One core's worth of JPEG encoding can't sustain 30fps at typical
- *      recording resolutions either, so capture runs one independent
- *      JPEG encoder per online CPU core in parallel, with their
- *      out-of-order output reassembled back into sequence before it
- *      reaches the pre-buffer or capture file. Live H.264 encoding used
- *      to happen here instead of JPEG; it couldn't reliably sustain
- *      30fps even after being moved off the UDP receive thread and
- *      given more CPU cores, so it was removed from this real-time path
- *      entirely.
- *   2. Transcode (batch, once a recording finishes): the capture file
- *      is read back, JPEG-decoded, and encoded to H.264 with FFmpeg
- *      (libx264), then muxed into the final MP4 -- with no real-time
- *      deadline this time, since all the source data already exists on
- *      disk by the time this runs.
+ * Single-phase pipeline: each raw YUV420 frame is JPEG-compressed --
+ * fast, no inter-frame dependencies -- and either kept in a rolling
+ * pre-buffer (no recording active) or written directly into the current
+ * recording's open AVI/MJPEG file. One core's worth of JPEG encoding
+ * can't sustain 30fps at typical recording resolutions, so capture runs
+ * one independent JPEG encoder per online CPU core in parallel, with
+ * their out-of-order output reassembled back into sequence before it
+ * reaches the pre-buffer or the AVI writer. Since a JPEG frame already
+ * IS its own final stored format, there's no decode/re-encode/mux step
+ * to defer until later the way live H.264 (this project's original
+ * design) or a JPEG-then-H.264 batch transcode (an intermediate design
+ * from earlier in this project's history) both needed -- closing a
+ * recording is just writing the AVI trailer/index, fast and synchronous.
  *
  * Dependencies:
- *   - FFmpeg libs: libavformat, libavcodec, libavutil, libswscale
+ *   - FFmpeg libs: libavformat, libavcodec, libavutil
  *   No other external dependencies.
  *
  * Build example (Linux / macOS):
  *   g++ -std=c++17 -O2 -pthread \
  *       main.cpp \
- *       $(pkg-config --cflags --libs libavformat libavcodec libavutil libswscale) \
+ *       $(pkg-config --cflags --libs libavformat libavcodec libavutil) \
  *       -o picam-recorder
  *
  * Usage:
@@ -39,7 +33,7 @@
  * Control — TCP plain-text protocol (one command per line):
  *
  *   Commands:
- *     start <filename.mp4>
+ *     start <filename.avi>
  *     stop
  *     status
  *     list
@@ -47,7 +41,7 @@
  *   Each response is one or more  key=value  lines followed by a blank line.
  *
  *   Quick test with nc:
- *     echo 'start clip01.mp4' | nc 127.0.0.1 8080
+ *     echo 'start clip01.avi' | nc 127.0.0.1 8080
  *     echo 'stop'             | nc 127.0.0.1 8080
  *     echo 'status'           | nc 127.0.0.1 8080
  *     echo 'list'             | nc 127.0.0.1 8080
@@ -69,7 +63,6 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
-#include <libswscale/swscale.h>
 }
 
 // ── stdlib ────────────────────────────────────────────────────────────────────
@@ -101,19 +94,16 @@ using Clock  = std::chrono::system_clock;
 using TP     = Clock::time_point;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RAII wrappers for FFmpeg's C-API alloc/free pairs -- used for both the
-// persistent JPEG capture encoder and the per-job transcode encoder/
-// decoder/scaler, so none of that state needs manual cleanup at every
-// throw/return point.
+// RAII wrappers for FFmpeg's C-API alloc/free pairs -- used for the
+// persistent per-capture-worker JPEG encoder, so none of that state
+// needs manual cleanup at every throw/return point.
 // ─────────────────────────────────────────────────────────────────────────────
 struct AVCodecContextDeleter { void operator()(AVCodecContext* p) const { if (p) avcodec_free_context(&p); } };
 struct AVFrameDeleter        { void operator()(AVFrame* p)        const { if (p) av_frame_free(&p); } };
 struct AVPacketDeleter       { void operator()(AVPacket* p)       const { if (p) av_packet_free(&p); } };
-struct SwsContextDeleter     { void operator()(SwsContext* p)     const { if (p) sws_freeContext(p); } };
 using AVCodecContextPtr = std::unique_ptr<AVCodecContext, AVCodecContextDeleter>;
 using AVFramePtr        = std::unique_ptr<AVFrame, AVFrameDeleter>;
 using AVPacketPtr       = std::unique_ptr<AVPacket, AVPacketDeleter>;
-using SwsContextPtr     = std::unique_ptr<SwsContext, SwsContextDeleter>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -376,201 +366,39 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// H.264 SPS dimension parser
+// AviWriter — muxes MJPEG frames straight into an AVI file
 //
-// Reads pic_width_in_mbs_minus1 and pic_height_in_map_units_minus1 from a
-// raw SPS NAL (without the leading start code or NAL header byte).
-// Implements just enough of ISO 14496-10 sec 7.3.2.1.1 to reach those fields.
+// A JPEG-compressed frame needs no decoding, re-encoding, or pixel-
+// format conversion to become the final stored format -- it already
+// IS an MJPEG video frame -- so unlike an H.264 muxer there's no
+// encoder state, no SPS/PPS/extradata to build, and no per-frame
+// timestamp accumulation from an external clock: PTS is just a plain
+// incrementing frame count in the stream's own {1, fps} timebase,
+// always monotonic even across any frames FrameQueue had to drop
+// under sustained backpressure. Same libavformat idioms as this file
+// used for MP4 muxing before it: pkt_->data borrows the caller's
+// buffer directly for the duration of one av_interleaved_write_frame
+// call, same as every packet write in this codebase already does.
 // ─────────────────────────────────────────────────────────────────────────────
-struct BitReader {
-    const uint8_t* data;
-    size_t         size;   // bytes
-    size_t         pos;    // current bit position
-
-    explicit BitReader(const std::vector<uint8_t>& v)
-        : data(v.data()), size(v.size()), pos(0) {}
-
-    uint32_t readBit()
-    {
-        if (pos >= size * 8) return 0;
-        uint32_t b = (data[pos / 8] >> (7 - pos % 8)) & 1;
-        ++pos;
-        return b;
-    }
-
-    uint32_t readBits(int n)
-    {
-        uint32_t v = 0;
-        for (int i = 0; i < n; ++i) v = (v << 1) | readBit();
-        return v;
-    }
-
-    // Exp-Golomb unsigned
-    uint32_t readUE()
-    {
-        int zeros = 0;
-        while (readBit() == 0 && pos < size * 8) ++zeros;
-        if (zeros == 0) return 0;
-        return (1u << zeros) - 1 + readBits(zeros);
-    }
-
-    // Exp-Golomb signed
-    int32_t readSE()
-    {
-        uint32_t v = readUE();
-        return (v & 1) ? (int32_t)((v + 1) / 2) : -(int32_t)(v / 2);
-    }
-};
-
-// Returns {width, height} or {0,0} on failure.
-// Expects the SPS payload WITHOUT the leading NAL header byte (0x67).
-static std::pair<int,int> parseSPSDimensions(const std::vector<uint8_t>& sps)
-{
-    if (sps.size() < 3) return {0, 0};
-
-    uint8_t profile_idc = sps[0];
-    BitReader br(sps);
-
-    br.readBits(8);  // profile_idc
-    br.readBits(8);  // constraint flags
-    br.readBits(8);  // level_idc
-
-    br.readUE();     // seq_parameter_set_id
-
-    if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
-        profile_idc == 244 || profile_idc ==  44 || profile_idc ==  83 ||
-        profile_idc ==  86 || profile_idc == 118 || profile_idc == 128 ||
-        profile_idc == 138 || profile_idc == 139 || profile_idc == 134) {
-        uint32_t chroma_format_idc = br.readUE();
-        if (chroma_format_idc == 3) br.readBit(); // separate_colour_plane_flag
-        br.readUE();   // bit_depth_luma_minus8
-        br.readUE();   // bit_depth_chroma_minus8
-        br.readBit();  // qpprime_y_zero_transform_bypass_flag
-        if (br.readBit()) { // seq_scaling_matrix_present_flag
-            int n = (chroma_format_idc != 3) ? 8 : 12;
-            for (int i = 0; i < n; ++i) {
-                if (br.readBit()) { // seq_scaling_list_present_flag[i]
-                    int sz = (i < 6) ? 16 : 64;
-                    int lastScale = 8, nextScale = 8;
-                    for (int j = 0; j < sz; ++j) {
-                        if (nextScale != 0) {
-                            int delta = br.readSE();
-                            nextScale = (lastScale + delta + 256) % 256;
-                        }
-                        lastScale = (nextScale == 0) ? lastScale : nextScale;
-                    }
-                }
-            }
-        }
-    }
-
-    br.readUE();  // log2_max_frame_num_minus4
-    uint32_t pic_order_cnt_type = br.readUE();
-    if (pic_order_cnt_type == 0) {
-        br.readUE(); // log2_max_pic_order_cnt_lsb_minus4
-    } else if (pic_order_cnt_type == 1) {
-        br.readBit(); // delta_pic_order_always_zero_flag
-        br.readSE();  // offset_for_non_ref_pic
-        br.readSE();  // offset_for_top_to_bottom_field
-        uint32_t n = br.readUE(); // num_ref_frames_in_pic_order_cnt_cycle
-        for (uint32_t i = 0; i < n; ++i) br.readSE();
-    }
-
-    br.readUE();   // max_num_ref_frames
-    br.readBit();  // gaps_in_frame_num_value_allowed_flag
-
-    uint32_t pic_width_in_mbs        = br.readUE() + 1;
-    uint32_t pic_height_in_map_units = br.readUE() + 1;
-    uint32_t frame_mbs_only_flag     = br.readBit();
-
-    int width  = static_cast<int>(pic_width_in_mbs        * 16);
-    int height = static_cast<int>(pic_height_in_map_units * 16 * (frame_mbs_only_flag ? 1 : 2));
-
-    // Crop if cropping rectangle is present
-    if (!frame_mbs_only_flag) br.readBit(); // mb_adaptive_frame_field_flag
-    br.readBit(); // direct_8x8_inference_flag
-    if (br.readBit()) { // frame_cropping_flag
-        uint32_t crop_l = br.readUE();
-        uint32_t crop_r = br.readUE();
-        uint32_t crop_t = br.readUE();
-        uint32_t crop_b = br.readUE();
-        width  -= static_cast<int>((crop_l + crop_r) * 2);
-        height -= static_cast<int>((crop_t + crop_b) * 2 * (frame_mbs_only_flag ? 1 : 2));
-    }
-
-    if (width <= 0 || height <= 0) return {0, 0};
-    return {width, height};
-}
-
-
-class MP4Muxer {
+class AviWriter {
 public:
-    MP4Muxer(const std::string& path,
-             const std::vector<uint8_t>& sps,
-             const std::vector<uint8_t>& pps)
+    AviWriter(const std::string& path, int width, int height, int fps)
         : meta_(path)
     {
-        if (avformat_alloc_output_context2(&fmtCtx_, nullptr, "mp4",
-                                           path.c_str()) < 0)
-            throw std::runtime_error("avformat_alloc_output_context2 failed");
+        if (avformat_alloc_output_context2(&fmtCtx_, nullptr, "avi", path.c_str()) < 0 || !fmtCtx_)
+            throw std::runtime_error("avformat_alloc_output_context2 (avi) failed");
 
         stream_ = avformat_new_stream(fmtCtx_, nullptr);
         if (!stream_) throw std::runtime_error("avformat_new_stream failed");
 
+        const int useFps = fps > 0 ? fps : 30;
         stream_->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-        stream_->codecpar->codec_id   = AV_CODEC_ID_H264;
-        stream_->codecpar->format     = AV_PIX_FMT_YUV420P;
-        stream_->codecpar->bit_rate   = 0;
-        stream_->time_base            = { 1, 90000 };
-
-        // SPS and PPS as stored include the NAL header byte (0x67 / 0x68).
-        // The AVCC extradata and dimension parser both need the payload without it.
-        const std::vector<uint8_t> spsPayload(sps.size() > 1 ? sps.begin() + 1 : sps.end(), sps.end());
-        const std::vector<uint8_t> ppsPayload(pps.size() > 1 ? pps.begin() + 1 : pps.end(), pps.end());
-
-        // ── Parse width/height directly from the SPS NAL bitstream ───────────
-        {
-            auto [w, h] = parseSPSDimensions(spsPayload);
-            if (w > 0 && h > 0) {
-                stream_->codecpar->width  = w;
-                stream_->codecpar->height = h;
-                std::cout << "[mp4] Dimensions: " << w << "x" << h << "\n";
-            } else {
-                std::ostringstream hex;
-                for (auto b : sps)
-                    hex << std::hex << std::setw(2) << std::setfill('0') << (int)b << ' ';
-                std::cerr << "[mp4] Warning: could not parse SPS dimensions. "
-                          << "SPS (" << sps.size() << " bytes): " << hex.str() << "\n";
-            }
-        }
-
-        // ── Build AVCC extradata (SPS + PPS payloads, no NAL header bytes) ───
-        // Format: [0x01][profile][compat][level][0xff][0xe1]
-        //         [sps_len_hi][sps_len_lo][sps_payload...]
-        //         [0x01][pps_len_hi][pps_len_lo][pps_payload...]
-        {
-            size_t extSize = 6 + 2 + spsPayload.size() + 1 + 2 + ppsPayload.size();
-            uint8_t* ext = static_cast<uint8_t*>(av_malloc(extSize + AV_INPUT_BUFFER_PADDING_SIZE));
-            if (ext) {
-                size_t i = 0;
-                ext[i++] = 0x01;                                          // configurationVersion
-                ext[i++] = spsPayload.size() > 0 ? spsPayload[0] : 0x42; // AVCProfileIndication
-                ext[i++] = spsPayload.size() > 1 ? spsPayload[1] : 0x00; // profile_compatibility
-                ext[i++] = spsPayload.size() > 2 ? spsPayload[2] : 0x1e; // AVCLevelIndication
-                ext[i++] = 0xff;                                          // lengthSizeMinusOne = 3
-                ext[i++] = 0xe1;                                          // numSequenceParameterSets = 1
-                ext[i++] = (spsPayload.size() >> 8) & 0xff;
-                ext[i++] =  spsPayload.size()       & 0xff;
-                std::memcpy(ext + i, spsPayload.data(), spsPayload.size()); i += spsPayload.size();
-                ext[i++] = 0x01;                                          // numPictureParameterSets = 1
-                ext[i++] = (ppsPayload.size() >> 8) & 0xff;
-                ext[i++] =  ppsPayload.size()       & 0xff;
-                std::memcpy(ext + i, ppsPayload.data(), ppsPayload.size());
-                std::memset(ext + extSize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-                stream_->codecpar->extradata      = ext;
-                stream_->codecpar->extradata_size = static_cast<int>(extSize);
-            }
-        }
+        stream_->codecpar->codec_id   = AV_CODEC_ID_MJPEG;
+        stream_->codecpar->format     = AV_PIX_FMT_YUVJ420P;
+        stream_->codecpar->width      = width;
+        stream_->codecpar->height     = height;
+        stream_->time_base            = { 1, useFps };
+        stream_->avg_frame_rate       = { useFps, 1 };
 
         if (avio_open(&fmtCtx_->pb, path.c_str(), AVIO_FLAG_WRITE) < 0)
             throw std::runtime_error("avio_open failed for: " + path);
@@ -582,74 +410,36 @@ public:
         if (!pkt_) throw std::runtime_error("av_packet_alloc failed");
     }
 
-    ~MP4Muxer()
+    ~AviWriter()
     {
         if (pkt_)    av_packet_free(&pkt_);
         if (fmtCtx_) avformat_free_context(fmtCtx_);
     }
 
-    MP4Muxer(const MP4Muxer&)            = delete;
-    MP4Muxer& operator=(const MP4Muxer&) = delete;
+    AviWriter(const AviWriter&)            = delete;
+    AviWriter& operator=(const AviWriter&) = delete;
 
-    void writeNALU(const std::vector<uint8_t>& nalu, uint32_t dts, TP wallTime, uint32_t frameSeq)
+    void writeFrame(const std::vector<uint8_t>& jpeg, int64_t timestampUs, uint32_t frameSeq)
     {
         std::lock_guard<std::mutex> lk(mu_);
 
-        // Accumulate a monotonic 64-bit DTS from the 32-bit RTP-scale timestamp.
-        // Use signed 32-bit delta so wraparound is handled correctly.
-        if (!baseSet_) {
-            prevRTP_    = dts;
-            accumDTS_   = 0;
-            lastDelta_  = 3000; // safe initial fallback (~30fps at 90kHz)
-            baseSet_    = true;
-        } else {
-            int32_t delta = static_cast<int32_t>(dts - prevRTP_);
-            if (delta > 0) {
-                lastDelta_ = static_cast<uint32_t>(delta);
-                accumDTS_ += lastDelta_;
-            } else {
-                accumDTS_ += lastDelta_;
-            }
-            prevRTP_ = dts;
-        }
-
-        uint64_t normDTS = accumDTS_;
-
-        // The extradata built in the constructor declares AVCC format
-        // with lengthSizeMinusOne = 3 (4-byte length-prefixed samples,
-        // per ISO/IEC 14496-15) -- so each sample written here must be
-        // prefixed with its own big-endian 4-byte length, NOT an
-        // Annex-B start code. Writing a start code instead (as this
-        // used to) leaves the moov/extradata correctly declaring AVCC
-        // while every sample's payload is actually Annex-B: any
-        // strict demuxer reads the first 4 bytes of a sample as a
-        // length, gets "1" from the 00 00 00 01 start code, and
-        // desyncs from there -- the container is well-formed but the
-        // bitstream inside it is garbage, so the file fails to play
-        // almost everywhere except a few very lenient players.
-        std::vector<uint8_t> avcc;
-        avcc.reserve(4 + nalu.size());
-        const uint32_t naluLen = static_cast<uint32_t>(nalu.size());
-        avcc.push_back(static_cast<uint8_t>((naluLen >> 24) & 0xff));
-        avcc.push_back(static_cast<uint8_t>((naluLen >> 16) & 0xff));
-        avcc.push_back(static_cast<uint8_t>((naluLen >> 8)  & 0xff));
-        avcc.push_back(static_cast<uint8_t>( naluLen        & 0xff));
-        avcc.insert(avcc.end(), nalu.begin(), nalu.end());
-
         av_packet_unref(pkt_);
-        pkt_->data         = avcc.data();
-        pkt_->size         = static_cast<int>(avcc.size());
+        pkt_->data         = const_cast<uint8_t*>(jpeg.data());
+        pkt_->size         = static_cast<int>(jpeg.size());
         pkt_->stream_index = stream_->index;
-        pkt_->pts          = static_cast<int64_t>(normDTS);
-        pkt_->dts          = static_cast<int64_t>(normDTS);
-        pkt_->duration     = static_cast<int64_t>(lastDelta_);
-        if ((nalu[0] & 0x1F) == 5) pkt_->flags |= AV_PKT_FLAG_KEY;
+        pkt_->pts          = frameCount_;
+        pkt_->dts          = frameCount_;
+        pkt_->duration     = 1;
+        pkt_->flags       |= AV_PKT_FLAG_KEY; // every MJPEG frame is independently decodable
 
         if (av_interleaved_write_frame(fmtCtx_, pkt_) < 0)
-            std::cerr << "[mp4] write error\n";
+            std::cerr << "[avi] write error\n";
 
-        meta_.record(static_cast<int>(nalu[0] & 0x1F), dts, wallTime, frameSeq);
-        ++naluCount_;
+        meta_.record(/*nal_type placeholder -- not a meaningful concept for JPEG, unused by consumers*/ 1,
+                     static_cast<uint32_t>(frameCount_),
+                     std::chrono::system_clock::time_point(std::chrono::microseconds(timestampUs)),
+                     frameSeq);
+        ++frameCount_;
     }
 
     int close()
@@ -658,146 +448,16 @@ public:
         av_write_trailer(fmtCtx_);
         avio_closep(&fmtCtx_->pb);
         meta_.close();
-        return naluCount_;
-    }
-
-private:
-    std::mutex       mu_;
-    AVFormatContext* fmtCtx_    = nullptr;
-    AVStream*        stream_    = nullptr;
-    AVPacket*        pkt_       = nullptr;
-    MetaWriter       meta_;
-    uint32_t         prevRTP_   = 0;
-    uint64_t         accumDTS_  = 0;
-    uint32_t         lastDelta_ = 3000;
-    bool             baseSet_   = false;
-    int              naluCount_ = 0;
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CaptureWriter / CaptureReader
-//
-// The on-disk intermediate for an in-progress recording: a flat,
-// sequential dump of JPEG-compressed frames (see the file's top
-// comment for why JPEG rather than literal raw YUV, and why capture is
-// split from H.264 encoding at all). Format is deliberately as simple
-// as possible -- write-once, read-once-sequentially, no container or
-// indexing needed since the transcode worker is the only reader and
-// always consumes it start-to-end exactly once, streaming (not loading
-// the whole file into memory, which could be sizeable for a long
-// recording even at JPEG's much smaller footprint than raw):
-//
-//   repeated: [frameSeq:4][timestampUs:8][jpegLen:4][jpeg bytes...]
-//
-// all integers big-endian.
-// ─────────────────────────────────────────────────────────────────────────────
-class CaptureWriter {
-public:
-    explicit CaptureWriter(std::string path)
-        : path_(std::move(path))
-        , f_(path_, std::ios::binary | std::ios::trunc)
-    {
-        if (!f_) throw std::runtime_error("cannot open capture file: " + path_);
-    }
-
-    const std::string& path() const { return path_; }
-
-    void appendFrame(const std::vector<uint8_t>& jpeg, int64_t timestampUs, uint32_t frameSeq)
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        writeU32(frameSeq);
-        writeU64(static_cast<uint64_t>(timestampUs));
-        writeU32(static_cast<uint32_t>(jpeg.size()));
-        f_.write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
-        ++frameCount_;
-    }
-
-    int close()
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        f_.flush();
-        f_.close();
         return frameCount_;
     }
 
 private:
-    void writeU32(uint32_t v)
-    {
-        char b[4] = { char(v >> 24), char(v >> 16), char(v >> 8), char(v) };
-        f_.write(b, 4);
-    }
-    void writeU64(uint64_t v)
-    {
-        char b[8];
-        for (int i = 0; i < 8; ++i) b[i] = char(v >> (56 - 8 * i));
-        f_.write(b, 8);
-    }
-
-    std::mutex    mu_;
-    std::string   path_;
-    std::ofstream f_;
-    int           frameCount_ = 0;
-};
-
-struct CapturedFrame {
-    std::vector<uint8_t> jpeg;
-    int64_t               timestampUs;
-    uint32_t               frameSeq;
-};
-
-// Sequential, one-frame-at-a-time reader for what CaptureWriter wrote
-// -- deliberately not a batch "read it all into a vector" API, so a
-// long recording's transcode doesn't need to hold every captured frame
-// in memory at once.
-class CaptureReader {
-public:
-    explicit CaptureReader(const std::string& path) : f_(path, std::ios::binary) {}
-
-    bool ok() const { return static_cast<bool>(f_); }
-
-    // Returns false at end-of-file or on any truncated/malformed
-    // trailing record (treated the same as a clean EOF -- a recording
-    // whose capture file got cut short still transcodes whatever
-    // complete frames it has rather than failing outright).
-    bool readNext(CapturedFrame& out)
-    {
-        uint32_t frameSeq = 0;
-        uint64_t tsU64    = 0;
-        uint32_t jpegLen  = 0;
-        if (!readU32(frameSeq)) return false;
-        if (!readU64(tsU64))    return false;
-        if (!readU32(jpegLen))  return false;
-
-        out.jpeg.resize(jpegLen);
-        if (jpegLen > 0) {
-            f_.read(reinterpret_cast<char*>(out.jpeg.data()), jpegLen);
-            if (f_.gcount() != static_cast<std::streamsize>(jpegLen)) return false;
-        }
-        out.timestampUs = static_cast<int64_t>(tsU64);
-        out.frameSeq    = frameSeq;
-        return true;
-    }
-
-private:
-    bool readU32(uint32_t& v)
-    {
-        unsigned char b[4];
-        f_.read(reinterpret_cast<char*>(b), 4);
-        if (f_.gcount() != 4) return false;
-        v = (uint32_t(b[0]) << 24) | (uint32_t(b[1]) << 16) | (uint32_t(b[2]) << 8) | uint32_t(b[3]);
-        return true;
-    }
-    bool readU64(uint64_t& v)
-    {
-        unsigned char b[8];
-        f_.read(reinterpret_cast<char*>(b), 8);
-        if (f_.gcount() != 8) return false;
-        v = 0;
-        for (int i = 0; i < 8; ++i) v = (v << 8) | b[i];
-        return true;
-    }
-
-    std::ifstream f_;
+    std::mutex       mu_;
+    AVFormatContext* fmtCtx_     = nullptr;
+    AVStream*        stream_     = nullptr;
+    AVPacket*        pkt_        = nullptr;
+    MetaWriter       meta_;
+    int              frameCount_ = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -942,60 +602,16 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TranscodeJob / TranscodeQueue
-//
-// Handed from drainLoop to transcodeLoop once a recording's post-buffer
-// has fully drained: capturePath is the finished .tmp.cap file to read
-// back and transcode, outputPath is the final .mp4 to produce. Unlike
-// FrameQueue, this is a plain unbounded queue with no drop-oldest
-// behavior -- jobs are rare (one per finished recording, not one per
-// frame) and each is independently valuable, so a backlog should just
-// be worked through in order rather than discarded.
-// ─────────────────────────────────────────────────────────────────────────────
-struct TranscodeJob {
-    std::string capturePath;
-    std::string outputPath;
-};
-
-class TranscodeQueue {
-public:
-    void push(TranscodeJob job)
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        jobs_.push_back(std::move(job));
-        cv_.notify_one();
-    }
-
-    bool pop(TranscodeJob& out, const std::atomic<bool>& shutdown)
-    {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait_for(lk, std::chrono::milliseconds(500),
-                     [&] { return !jobs_.empty() || shutdown.load(); });
-        if (jobs_.empty()) return false;
-        out = std::move(jobs_.front());
-        jobs_.pop_front();
-        return true;
-    }
-
-    void wake() { cv_.notify_all(); }
-
-private:
-    std::mutex               mu_;
-    std::condition_variable  cv_;
-    std::deque<TranscodeJob> jobs_;
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Recorder
 // ─────────────────────────────────────────────────────────────────────────────
-// Idle -> Recording -> Draining -> Encoding -> Idle. Encoding is new:
-// once a recording's post-buffer has drained there's no MP4 yet, only
-// a finished capture file waiting for the transcode worker -- see the
-// file's top comment.
-enum class RecordState { Idle, Recording, Draining, Encoding };
+// Idle -> Recording -> Draining -> Idle. Closing a recording (writing
+// the AVI trailer/index) is fast and synchronous -- there's no batch
+// step to defer, so unlike an earlier version of this file there's no
+// separate "Encoding" state between Draining and Idle.
+enum class RecordState { Idle, Recording, Draining };
 
 struct RecorderStatus {
-    std::string state;   // "idle" | "recording" | "draining" | "encoding"
+    std::string state;   // "idle" | "recording" | "draining"
     std::string file;
 };
 
@@ -1034,8 +650,7 @@ public:
         readerThread_ = std::thread([this]{ readStream(); });
         for (int i = 0; i < numCaptureWorkers_; ++i)
             captureThreads_.emplace_back([this, i]{ captureWorkerLoop(i); });
-        transcodeThread_ = std::thread([this]{ transcodeLoop(); });
-        drainThread_     = std::thread([this]{ drainLoop(); });
+        drainThread_ = std::thread([this]{ drainLoop(); });
     }
 
     ~Recorder()
@@ -1043,11 +658,9 @@ public:
         shutdown_ = true;
         drainCv_.notify_all();
         frameQueue_.wake();
-        transcodeQueue_.wake();
-        if (drainThread_.joinable())     drainThread_.join();
-        if (readerThread_.joinable())    readerThread_.join();
+        if (drainThread_.joinable())  drainThread_.join();
+        if (readerThread_.joinable()) readerThread_.join();
         for (auto& t : captureThreads_) if (t.joinable()) t.join();
-        if (transcodeThread_.joinable()) transcodeThread_.join();
     }
 
     std::string start(const std::string& filename)
@@ -1066,39 +679,34 @@ public:
                 drainCv_.notify_all();
                 return current_;
             }
-            // Idle or Encoding both fall through to start a new
-            // recording -- Encoding means a PREVIOUS recording is
-            // still being transcoded in the background, which doesn't
-            // block a new one from starting: its capture file is
-            // entirely independent, and capture never waits on
-            // transcode (see the file's top comment).
+            // Idle falls through to start a new recording.
         }
 
         fs::create_directories(dir_);
         std::string stem    = fs::path(filename).stem().string();
-        std::string outPath = (fs::path(dir_) / (stem + ".mp4")).string();
-        std::string capPath = (fs::path(dir_) / (stem + ".tmp.cap")).string();
+        std::string outPath = (fs::path(dir_) / (stem + ".avi")).string();
 
-        if (fs::exists(outPath) || fs::exists(capPath))
+        if (fs::exists(outPath))
             throw std::runtime_error("file already exists: " + outPath);
 
-        // Unlike the old live-encode design, capture doesn't need an
-        // H.264 encoder to be ready at all -- it just starts writing
-        // whatever JPEG frames arrive next, so there's no equivalent
-        // of the old "wait up to 10s for SPS/PPS" step here anymore.
-        auto cw = std::make_unique<CaptureWriter>(capPath);
+        // A JPEG frame is already its own final stored format, so
+        // there's no equivalent of the old live-H.264 design's "wait
+        // up to 10s for SPS/PPS" step here -- capture just starts
+        // writing whatever JPEG frames arrive next, straight into the
+        // AVI file.
+        auto writer = std::make_unique<AviWriter>(outPath, rawWidth_, rawHeight_, rawFps_);
 
         auto pre = preBuf_.drain();
         std::cout << "[rec] Pre-buffer: flushing " << pre.size() << " frames\n";
         for (auto& f : pre)
-            cw->appendFrame(f.jpeg, f.timestampUs, f.frameSeq);
+            writer->writeFrame(f.jpeg, f.timestampUs, f.frameSeq);
 
         {
             std::lock_guard<std::mutex> lk(mu_);
-            captureWriter_ = std::move(cw);
-            current_       = outPath;
-            state_         = RecordState::Recording;
-            drainCmd_      = DrainCmd::Wait;
+            aviWriter_ = std::move(writer);
+            current_   = outPath;
+            state_     = RecordState::Recording;
+            drainCmd_  = DrainCmd::Wait;
         }
 
         std::cout << "[rec] Recording started: " << outPath << "\n";
@@ -1108,7 +716,7 @@ public:
     std::string stop()
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (state_ == RecordState::Idle || state_ == RecordState::Encoding)
+        if (state_ == RecordState::Idle)
             throw std::runtime_error("not recording");
         if (state_ == RecordState::Draining) {
             std::cout << "[rec] Already draining: " << current_ << "\n";
@@ -1131,7 +739,6 @@ public:
         std::string s = "idle";
         if (state_ == RecordState::Recording)     s = "recording";
         else if (state_ == RecordState::Draining) s = "draining";
-        else if (state_ == RecordState::Encoding) s = "encoding";
         return { s, current_ };
     }
 
@@ -1157,15 +764,15 @@ public:
 private:
     // Dispatches one freshly JPEG-captured frame, already back in
     // strict frameSeq order courtesy of reorder_: always into the
-    // rolling pre-buffer, and additionally into the current recording's
-    // capture file if one is active.
+    // rolling pre-buffer, and additionally straight into the current
+    // recording's open AVI file if one is active.
     void onCapturedFrame(std::vector<uint8_t> jpeg, int64_t timestampUs, uint32_t frameSeq)
     {
         TP wallTime = std::chrono::system_clock::time_point(std::chrono::microseconds(timestampUs));
 
         std::lock_guard<std::mutex> lk(mu_);
-        if ((state_ == RecordState::Recording || state_ == RecordState::Draining) && captureWriter_)
-            captureWriter_->appendFrame(jpeg, timestampUs, frameSeq);
+        if ((state_ == RecordState::Recording || state_ == RecordState::Draining) && aviWriter_)
+            aviWriter_->writeFrame(jpeg, timestampUs, frameSeq);
         preBuf_.push(std::move(jpeg), timestampUs, wallTime, frameSeq);
     }
 
@@ -1226,31 +833,30 @@ private:
                 continue;
             }
 
-            // Post-buffer fully drained -- capture is done for this
-            // recording. Unlike the old live-encode design, there is
-            // no MP4 yet at this point, only a capture file of
-            // buffered JPEG frames -- hand off to the transcode worker
-            // rather than finalizing anything here directly.
-            std::unique_ptr<CaptureWriter> cw;
+            // Post-buffer fully drained -- finalize the AVI file
+            // directly. A JPEG frame is already its own final stored
+            // format, so unlike the old live-H.264 or JPEG-then-H.264
+            // batch-transcode designs, there's no encode/mux work left
+            // to defer: closing just means writing the AVI trailer/
+            // index, fast enough to do right here.
+            std::unique_ptr<AviWriter> writer;
             std::string outPath;
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                cw        = std::move(captureWriter_);
+                writer    = std::move(aviWriter_);
                 outPath   = current_;
-                state_    = RecordState::Encoding;
+                state_    = RecordState::Idle;
+                current_  = "";
                 drainCmd_ = DrainCmd::Wait;
             }
 
-            std::string capPath = cw->path();
-            int nFrames = cw->close();
+            int nFrames = writer->close();
             auto recSecs = std::chrono::duration<double>(Clock::now() - stopTime_).count();
             std::cout << "[rec] " << toRFC3339(Clock::now())
-                      << " capture closed: " << capPath
+                      << " Recording finalized: " << outPath
                       << " (" << nFrames << " frames, "
                       << std::fixed << std::setprecision(1) << recSecs
-                      << "s since stop) -- queued for transcode\n";
-
-            transcodeQueue_.push(TranscodeJob{ capPath, outPath });
+                      << "s since stop)\n";
         }
     }
 
@@ -1553,243 +1159,11 @@ private:
                       << " CPU(s) (core " << kReservedCore << " reserved for receive/control)\n";
     }
 
-    // Processes finished recordings' capture files into final MP4s, one
-    // at a time -- unlike live encoding, this has no real-time deadline
-    // to hit, so it can simply take as long as it needs. A transcode
-    // job in progress when shutdown_ is set is allowed to finish (only
-    // checked between jobs), matching readStream's own retry-loop
-    // granularity.
-    void transcodeLoop()
-    {
-        widenAffinityToAllCores("[xcode]");
-
-        TranscodeJob job;
-        while (!shutdown_) {
-            if (!transcodeQueue_.pop(job, shutdown_)) continue;
-            try {
-                runTranscodeJob(job);
-            } catch (const std::exception& e) {
-                std::cerr << "[xcode] Job failed for " << job.capturePath << ": " << e.what() << "\n";
-            }
-            // Only reset to Idle if this job's output is still the
-            // Recorder's "current" one -- a newer recording may have
-            // already started (and even finished) while this job was
-            // running, and its own state must not be clobbered here.
-            std::lock_guard<std::mutex> lk(mu_);
-            if (current_ == job.outputPath && state_ == RecordState::Encoding) {
-                state_   = RecordState::Idle;
-                current_ = "";
-            }
-        }
-    }
-
-    struct PendingNALU { std::vector<uint8_t> nalu; uint32_t dts; TP wallTime; uint32_t frameSeq; };
-
-    // Reads capturePath sequentially (streaming, not loading it all
-    // into memory at once -- a long recording could otherwise use a
-    // lot of RAM even at JPEG's much smaller footprint than raw),
-    // JPEG-decodes each frame, encodes it fresh with H.264, and muxes
-    // the result into outputPath. A fresh encoder/decoder/scaler is
-    // used for every job (opened and torn down here) rather than kept
-    // as persistent Recorder state, since jobs are infrequent and this
-    // keeps each one fully self-contained.
-    void runTranscodeJob(const TranscodeJob& job)
-    {
-        CaptureReader reader(job.capturePath);
-        if (!reader.ok())
-            throw std::runtime_error("cannot open capture file: " + job.capturePath);
-
-        // ── Fresh H.264 encoder for just this job ─────────────────────
-        const AVCodec* h264Codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-        if (!h264Codec) throw std::runtime_error("H.264 encoder not found (need FFmpeg with libx264)");
-
-        AVCodecContextPtr encCtx(avcodec_alloc_context3(h264Codec));
-        if (!encCtx) throw std::runtime_error("avcodec_alloc_context3 (h264) failed");
-        encCtx->width        = rawWidth_;
-        encCtx->height       = rawHeight_;
-        encCtx->time_base    = { 1, rawFps_ };
-        encCtx->framerate    = { rawFps_, 1 };
-        encCtx->pix_fmt      = AV_PIX_FMT_YUV420P;
-        encCtx->gop_size     = rawFps_;
-        encCtx->max_b_frames = 0;
-
-        AVDictionary* opts = nullptr;
-        av_dict_set(&opts, "preset", "ultrafast", 0);
-        av_dict_set(&opts, "tune",   "zerolatency", 0);
-        int ret = avcodec_open2(encCtx.get(), h264Codec, &opts);
-        av_dict_free(&opts);
-        if (ret < 0) {
-            char err[128]; av_strerror(ret, err, sizeof(err));
-            throw std::runtime_error(std::string("avcodec_open2 (h264): ") + err);
-        }
-
-        AVFramePtr encFrame(av_frame_alloc());
-        if (!encFrame) throw std::runtime_error("av_frame_alloc (h264) failed");
-        encFrame->format = AV_PIX_FMT_YUV420P;
-        encFrame->width  = rawWidth_;
-        encFrame->height = rawHeight_;
-        if (av_frame_get_buffer(encFrame.get(), 0) < 0)
-            throw std::runtime_error("av_frame_get_buffer (h264) failed");
-
-        AVPacketPtr encPkt(av_packet_alloc());
-        if (!encPkt) throw std::runtime_error("av_packet_alloc (h264) failed");
-
-        // ── JPEG decoder, reused for every frame in this job ──────────
-        const AVCodec* jpegDec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
-        if (!jpegDec) throw std::runtime_error("MJPEG decoder not found");
-        AVCodecContextPtr decCtx(avcodec_alloc_context3(jpegDec));
-        if (!decCtx) throw std::runtime_error("avcodec_alloc_context3 (mjpeg dec) failed");
-        if (avcodec_open2(decCtx.get(), jpegDec, nullptr) < 0)
-            throw std::runtime_error("avcodec_open2 (mjpeg dec) failed");
-
-        AVFramePtr decFrame(av_frame_alloc());
-        if (!decFrame) throw std::runtime_error("av_frame_alloc (mjpeg dec) failed");
-        AVPacketPtr decPkt(av_packet_alloc());
-        if (!decPkt) throw std::runtime_error("av_packet_alloc (mjpeg dec) failed");
-
-        // Built lazily once the JPEG decoder reports its actual output
-        // format/size (MJPEG typically decodes to YUVJ420P); converts
-        // explicitly to plain YUV420P rather than relying on the
-        // encoder silently accepting a full-range format it wasn't
-        // configured for.
-        SwsContextPtr sws;
-
-        std::vector<uint8_t> sps, pps;
-        std::unique_ptr<MP4Muxer> muxer;
-        std::vector<PendingNALU> pending; // buffered until sps+pps are both known
-
-        auto dtsFor = [](int64_t timestampUs) -> uint32_t {
-            return static_cast<uint32_t>((timestampUs * 90LL) / 1000LL);
-        };
-
-        auto dispatchNALU = [&](const uint8_t* naluData, size_t len, uint32_t dts, TP wallTime, uint32_t frameSeq) {
-            if (len == 0) return;
-            uint8_t nalType = naluData[0] & 0x1F;
-            std::vector<uint8_t> v(naluData, naluData + len);
-            if (nalType == 7) sps = v;
-            else if (nalType == 8) pps = v;
-
-            if (!muxer && !sps.empty() && !pps.empty()) {
-                muxer = std::make_unique<MP4Muxer>(job.outputPath, sps, pps);
-                for (auto& pn : pending)
-                    muxer->writeNALU(pn.nalu, pn.dts, pn.wallTime, pn.frameSeq);
-                pending.clear();
-            }
-
-            if (muxer) muxer->writeNALU(v, dts, wallTime, frameSeq);
-            else       pending.push_back({ std::move(v), dts, wallTime, frameSeq });
-        };
-
-        // Same Annex-B/AVCC-agnostic NALU splitting picam-recorder has
-        // always used for libx264's output.
-        auto dispatchEncodedPacket = [&](AVPacket* pkt, uint32_t dts, TP wallTime, uint32_t frameSeq) {
-            const uint8_t* p   = pkt->data;
-            const uint8_t* end = pkt->data + pkt->size;
-            bool annexB = (pkt->size >= 4 && p[0] == 0 && p[1] == 0 && (p[2] == 1 || (p[2] == 0 && p[3] == 1)));
-
-            if (annexB) {
-                const uint8_t* naluStart = nullptr;
-                while (p < end) {
-                    bool sc3 = (p + 3 <= end && p[0]==0 && p[1]==0 && p[2]==1);
-                    bool sc4 = (p + 4 <= end && p[0]==0 && p[1]==0 && p[2]==0 && p[3]==1);
-                    if (sc3 || sc4) {
-                        if (naluStart) {
-                            const uint8_t* naluEnd = p;
-                            while (naluEnd > naluStart && *(naluEnd-1) == 0) --naluEnd;
-                            dispatchNALU(naluStart, naluEnd - naluStart, dts, wallTime, frameSeq);
-                        }
-                        p += sc4 ? 4 : 3;
-                        naluStart = p;
-                    } else {
-                        ++p;
-                    }
-                }
-                if (naluStart && naluStart < end)
-                    dispatchNALU(naluStart, end - naluStart, dts, wallTime, frameSeq);
-            } else {
-                while (p + 4 <= end) {
-                    uint32_t naluLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
-                                       (uint32_t(p[2]) <<  8) |  uint32_t(p[3]);
-                    p += 4;
-                    if (p + naluLen > end) break;
-                    dispatchNALU(p, naluLen, dts, wallTime, frameSeq);
-                    p += naluLen;
-                }
-            }
-        };
-
-        int64_t       encPts = 0;
-        size_t        frameCount = 0;
-        CapturedFrame cf;
-        CapturedFrame lastFrame{};
-        bool          haveAny = false;
-
-        while (reader.readNext(cf)) {
-            ++frameCount;
-            lastFrame = cf;
-            haveAny   = true;
-
-            av_packet_unref(decPkt.get());
-            decPkt->data = cf.jpeg.data();
-            decPkt->size = static_cast<int>(cf.jpeg.size());
-            if (avcodec_send_packet(decCtx.get(), decPkt.get()) < 0) continue;
-
-            while (avcodec_receive_frame(decCtx.get(), decFrame.get()) == 0) {
-                if (!sws) {
-                    sws.reset(sws_getContext(decFrame->width, decFrame->height, static_cast<AVPixelFormat>(decFrame->format),
-                                              rawWidth_, rawHeight_, AV_PIX_FMT_YUV420P,
-                                              SWS_BILINEAR, nullptr, nullptr, nullptr));
-                    if (!sws) throw std::runtime_error("sws_getContext failed");
-                }
-
-                if (av_frame_make_writable(encFrame.get()) == 0) {
-                    sws_scale(sws.get(), decFrame->data, decFrame->linesize, 0, decFrame->height,
-                              encFrame->data, encFrame->linesize);
-
-                    encFrame->pts = encPts++;
-                    TP       wallTime = std::chrono::system_clock::time_point(std::chrono::microseconds(cf.timestampUs));
-                    uint32_t dts      = dtsFor(cf.timestampUs);
-
-                    if (avcodec_send_frame(encCtx.get(), encFrame.get()) == 0) {
-                        while (avcodec_receive_packet(encCtx.get(), encPkt.get()) == 0) {
-                            dispatchEncodedPacket(encPkt.get(), dts, wallTime, cf.frameSeq);
-                            av_packet_unref(encPkt.get());
-                        }
-                    }
-                }
-                av_frame_unref(decFrame.get());
-            }
-        }
-
-        // Flush the encoder for any internally-buffered output.
-        avcodec_send_frame(encCtx.get(), nullptr);
-        while (avcodec_receive_packet(encCtx.get(), encPkt.get()) == 0) {
-            TP       wallTime = haveAny ? std::chrono::system_clock::time_point(std::chrono::microseconds(lastFrame.timestampUs)) : Clock::now();
-            uint32_t dts      = haveAny ? dtsFor(lastFrame.timestampUs) : 0;
-            uint32_t seq      = haveAny ? lastFrame.frameSeq : 0;
-            dispatchEncodedPacket(encPkt.get(), dts, wallTime, seq);
-            av_packet_unref(encPkt.get());
-        }
-
-        std::error_code ec;
-        if (!muxer) {
-            std::cerr << "[xcode] " << job.capturePath << ": no frames produced a keyframe -- discarding, no MP4 written\n";
-            fs::remove(job.capturePath, ec);
-            return;
-        }
-
-        int n = muxer->close();
-        fs::remove(job.capturePath, ec);
-        std::cout << "[xcode] " << toRFC3339(Clock::now()) << " transcoded: " << job.outputPath
-                  << " (" << n << " NALUs, " << std::fixed << std::setprecision(1)
-                  << fileSizeMiB(job.outputPath) << " MiB, from " << frameCount << " captured frames)\n";
-    }
-
     // ── members ──────────────────────────────────────────────────────────────
     std::mutex                     mu_;
     RecordState                    state_   = RecordState::Idle;
     std::string                    current_;
-    std::unique_ptr<CaptureWriter> captureWriter_;
+    std::unique_ptr<AviWriter>     aviWriter_;
     std::string                    rawHost_;
     int                            rawPort_;
     int                            rawWidth_;
@@ -1810,7 +1184,6 @@ private:
 
     std::thread                    readerThread_;
     std::vector<std::thread>       captureThreads_;
-    std::thread                    transcodeThread_;
     std::thread                    drainThread_;
     std::atomic<bool>              shutdown_{ false };
 
@@ -1824,8 +1197,6 @@ private:
     std::mutex                     firstFrameMu_;
     std::atomic<bool>              firstFrameReady_{ false };
     std::condition_variable        firstFrameCv_;
-
-    TranscodeQueue                 transcodeQueue_; // finished recordings awaiting transcode -- see its own comment
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,17 +1,14 @@
 # picam-recorder
 
-**Discontinued.** picam-orchestrator now records directly from its own already-running VP8 encode (pre/post-buffered WebM, no separate recorder process, no independent real-time encode to keep up with) — see picam-orchestrator-go's README, "Manual and automatic recording". This repo and its published packages are left in place for reference, but CI/nightly publishing is disabled and no further work is planned here.
-
-Records H.264 RTSP streams to MP4 files with configurable pre-roll and post-roll buffering. Designed for Raspberry Pi camera systems and runs as a systemd service.
+Records a Motion-JPEG stream to AVI files with configurable pre-roll and post-roll buffering. Designed for Raspberry Pi camera systems and runs as a systemd service.
 
 ## Features
 
 - Continuous rolling pre-buffer (default 10 s) — captures footage *before* the record command arrives
 - Configurable post-buffer (default 10 s) — keeps recording after the stop command
 - TCP control server for start / stop / status / list commands
-- Sidecar CSV metadata file per recording (frame number, RTP time, wall-clock time, NAL type)
-- Robust RTP-to-wall-clock sync via RTSP Sender Report packets
-- Handles both Annex-B and AVCC H.264 packet formats
+- Sidecar CSV metadata file per recording
+- Per-core parallel JPEG capture, muxed straight into AVI as frames arrive — no batch transcode step
 
 ## Dependencies
 
@@ -109,7 +106,7 @@ Plain-text TCP on port 8080. Send one command per connection; response is `key=v
 
 | Command | Description |
 |---------|-------------|
-| `start <name>` | Start recording to `<name>.mp4` |
+| `start <name>` | Start recording to `<name>.avi` |
 | `stop` | Stop recording; drains post-buffer before closing |
 | `status` | Returns current recording state |
 | `list` | Lists all recordings with metadata |
@@ -125,5 +122,5 @@ echo 'list'          | nc 127.0.0.1 8080
 
 Each recording produces two files:
 
-- **`<name>.mp4`** — H.264 video in MP4 container
-- **`<name>.csv`** — Frame metadata: `frame`, `rtp_time`, `wall_time` (RFC 3339), `nal_type`
+- **`<name>.avi`** — Motion-JPEG video in an AVI container
+- **`<name>.csv`** — Frame metadata: `frame`, `frame_seq`, `ts_us`, `rtp_time`, `wall_time` (RFC 3339), `nal_type`

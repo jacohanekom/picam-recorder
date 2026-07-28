@@ -1,11 +1,8 @@
 name: Build
 
-# Disabled: picam-recorder is discontinued, superseded by
-# picam-orchestrator's own built-in recording (see README.md). Left as
-# workflow_dispatch-only so it can still be run manually if ever needed,
-# without auto-publishing nightly builds nobody consumes anymore.
 on:
-  workflow_dispatch:
+  push:
+  pull_request:
 
 jobs:
   build-deb:
@@ -77,7 +74,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends \
                 build-essential debhelper pkg-config \
-                libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+                libavformat-dev libavcodec-dev libavutil-dev
               dpkg-buildpackage -us -uc -b
             '
 
