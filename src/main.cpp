@@ -122,6 +122,20 @@ static constexpr int    kDefaultPort     = 8080;
 static constexpr double kDefaultPreSecs  = 10.0;
 static constexpr double kDefaultPostSecs = 10.0;
 
+// The CPU core main() pins the whole process to at startup (see its
+// "Pin this process to CPU core 2" step) and that the systemd unit's
+// own CPUAffinity= setting matches. Every thread inherits this
+// core-only mask by default; the UDP receive and TCP control threads
+// are meant to stay confined to it so they always get scheduled
+// promptly, uncontended by anything else this process does. Any
+// thread that needs real parallelism (JPEG capture workers, H.264
+// transcode) must widen to every OTHER core instead of every core --
+// sharing this one with them would starve the receive loop of the CPU
+// time it needs to keep draining the UDP socket in time, which is
+// exactly the stall this whole pipeline exists to avoid (see "[raw]
+// Dropped incomplete frame").
+static constexpr int kReservedCore = 2;
+
 // Number of CPUs actually online right now (never below 1) -- used to
 // size the JPEG capture worker pool and CPU-affinity masks.
 static long onlineCpuCount()
@@ -1508,31 +1522,35 @@ private:
         }
     }
 
-    // Widens this thread's own CPU affinity to every online core. Every
-    // thread inherits main()'s core-2-only affinity mask (set before
-    // any thread here existed) unless it explicitly changes its own --
-    // that's fine, intentional even, for the receive/TCP-control
-    // threads, which stay lightweight and benefit from a reserved,
-    // uncontended core. The capture workers and the transcode thread
-    // both need more: libx264 (transcode) and the mjpeg encoder
-    // (capture) both auto-detect their own internal thread count from
-    // how many CPUs are visible to the calling thread's affinity mask
-    // (av_cpu_count() reads sched_getaffinity()), so a single-core mask
-    // would silently force single-threaded encoding regardless of how
-    // many cores this Pi actually has -- and even where that internal
-    // auto-threading doesn't help, running N independent worker threads
-    // (capture) each pinned to all cores lets the kernel actually
-    // schedule them in parallel instead of stacking them onto one core.
+    // Widens this thread's own CPU affinity to every online core EXCEPT
+    // kReservedCore. Every thread inherits main()'s core-2-only
+    // affinity mask (set before any thread here existed) unless it
+    // explicitly changes its own -- that's fine, intentional even, for
+    // the receive/TCP-control threads, which stay lightweight and need
+    // that core kept genuinely uncontended (see kReservedCore's own
+    // comment: sharing it with a CPU-bound thread starves the receive
+    // loop and reintroduces "[raw] Dropped incomplete frame" one layer
+    // up, as happened when this first widened to *every* core including
+    // the reserved one). The capture workers and the transcode thread
+    // both need more than one core: libx264 (transcode) and the mjpeg
+    // encoder (capture) both auto-detect their own internal thread
+    // count from how many CPUs are visible to the calling thread's
+    // affinity mask (av_cpu_count() reads sched_getaffinity()), and
+    // running N independent worker threads (capture) each eligible for
+    // every non-reserved core lets the kernel schedule them in parallel
+    // instead of stacking them onto one core.
     static void widenAffinityToAllCores(const char* logTag)
     {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         long nCpus = onlineCpuCount();
-        for (long i = 0; i < nCpus; ++i) CPU_SET(static_cast<int>(i), &cpuset);
+        for (long i = 0; i < nCpus; ++i)
+            if (static_cast<int>(i) != kReservedCore) CPU_SET(static_cast<int>(i), &cpuset);
         if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
             std::cerr << logTag << " Warning: failed to widen thread's CPU affinity: " << strerror(errno) << "\n";
         else
-            std::cout << logTag << " Thread using up to " << nCpus << " CPU(s)\n";
+            std::cout << logTag << " Thread using up to " << CPU_COUNT(&cpuset)
+                      << " CPU(s) (core " << kReservedCore << " reserved for receive/control)\n";
     }
 
     // Processes finished recordings' capture files into final MP4s, one
@@ -1956,15 +1974,15 @@ int main(int argc, char* argv[])
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
 
-    // ── 0. Pin this process to CPU core 2 ────────────────────────────────────
+    // ── 0. Pin this process to the reserved CPU core ──────────────────────────
     {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(2, &cpuset);
+        CPU_SET(kReservedCore, &cpuset);
         if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
             std::cerr << "[main] Warning: failed to set CPU affinity: " << strerror(errno) << "\n";
         else
-            std::cout << "[main] Pinned to CPU core 2\n";
+            std::cout << "[main] Pinned to CPU core " << kReservedCore << "\n";
     }
 
     // ── 1. Determine config file path ─────────────────────────────────────────

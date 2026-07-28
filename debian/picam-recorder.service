@@ -9,6 +9,9 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=picam-recorder
+# Must match kReservedCore in src/main.cpp -- capture/transcode worker
+# threads deliberately widen their own affinity to every OTHER core,
+# leaving this one exclusively for the UDP receive/TCP control threads.
 CPUAffinity=2
 
 [Install]
