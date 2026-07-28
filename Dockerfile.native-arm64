@@ -6,8 +6,8 @@
 # projects' Dockerfile.native-arm64.
 #
 # Every build dependency here (pkg-config, libavformat-dev,
-# libavcodec-dev, libavutil-dev) is a plain Debian package — no
-# Raspberry Pi-specific repo needed.
+# libavcodec-dev, libavutil-dev, libswscale-dev) is a plain Debian
+# package — no Raspberry Pi-specific repo needed.
 #
 # Standard debhelper build (debhelper-compat in Build-Depends,
 # `dh $@` in debian/rules) — the packaged Version: comes from
@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libavformat-dev \
         libavcodec-dev \
         libavutil-dev \
+        libswscale-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

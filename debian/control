@@ -2,14 +2,16 @@ Source: picam-recorder
 Section: video
 Priority: optional
 Maintainer: Jaco Hanekom <jhanekom@gmail.com>
-Build-Depends: debhelper-compat (= 13), pkg-config, libavformat-dev, libavcodec-dev, libavutil-dev
+Build-Depends: debhelper-compat (= 13), pkg-config, libavformat-dev, libavcodec-dev, libavutil-dev, libswscale-dev
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 
 Package: picam-recorder
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, aipicam-config
-Description: RTSP stream recorder with pre/post buffer
- Records H.264 RTSP streams to MP4 files with configurable pre-roll
- and post-roll buffers. Controlled via a TCP plain-text protocol.
- Writes an MP4 and CSV metadata sidecar per recording.
+Description: picam-raw stream recorder with pre/post buffer
+ Records picam-raw's raw YUV420 UDP stream to H.264 MP4 files with
+ configurable pre-roll and post-roll buffers, via a JPEG-captured
+ intermediate transcoded to H.264 after each recording finishes.
+ Controlled via a TCP plain-text protocol. Writes an MP4 and CSV
+ metadata sidecar per recording.

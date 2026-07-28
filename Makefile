@@ -1,7 +1,7 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -O2 -pthread -Wall -Wextra
-CXXFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil)
-LDFLAGS  := $(shell pkg-config --libs   libavformat libavcodec libavutil)
+CXXFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil libswscale)
+LDFLAGS  := $(shell pkg-config --libs   libavformat libavcodec libavutil libswscale)
 
 all: picam-recorder
 
