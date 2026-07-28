@@ -1,8 +1,11 @@
 name: Build
 
+# Disabled: picam-recorder is discontinued, superseded by
+# picam-orchestrator's own built-in recording (see README.md). Left as
+# workflow_dispatch-only so it can still be run manually if ever needed,
+# without auto-publishing nightly builds nobody consumes anymore.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   build-deb:

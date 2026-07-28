@@ -1,5 +1,7 @@
 # picam-recorder
 
+**Discontinued.** picam-orchestrator now records directly from its own already-running VP8 encode (pre/post-buffered WebM, no separate recorder process, no independent real-time encode to keep up with) — see picam-orchestrator-go's README, "Manual and automatic recording". This repo and its published packages are left in place for reference, but CI/nightly publishing is disabled and no further work is planned here.
+
 Records H.264 RTSP streams to MP4 files with configurable pre-roll and post-roll buffering. Designed for Raspberry Pi camera systems and runs as a systemd service.
 
 ## Features
