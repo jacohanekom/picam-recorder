@@ -1,6 +1,6 @@
 # picam-recorder
 
-Records a Motion-JPEG stream to AVI files with configurable pre-roll and post-roll buffering. Designed for Raspberry Pi camera systems and runs as a systemd service.
+Records a Motion-JPEG stream to AVI files with configurable pre-roll and post-roll buffering, and continuously publishes that same MJPEG capture live over HTTP. Designed for Raspberry Pi camera systems and runs as a systemd service.
 
 ## Features
 
@@ -10,6 +10,7 @@ Records a Motion-JPEG stream to AVI files with configurable pre-roll and post-ro
 - Sidecar CSV metadata file per recording
 - Per-core parallel JPEG capture, muxed straight into AVI as frames arrive — no batch transcode step
 - JPEG compression via libjpeg-turbo's TurboJPEG API — same encoder and 1-100 IJG quality scale as picam-orchestrator-go's own live MJPEG tiers
+- **`GET /stream?stream=main-high|main-low`** — every captured frame is compressed at two qualities and published as continuous MJPEG (`multipart/x-mixed-replace`), always, independent of whether a recording is in progress. picam-orchestrator-go proxies this straight through to its own live main view instead of separately re-compressing the same frames itself
 
 ## Dependencies
 
@@ -79,9 +80,11 @@ raw_host = 127.0.0.1                 # picam-raw's UDP host
 raw_port = 8560                      # picam-raw's UDP port (defaults from /etc/aipicam/streams.conf)
 dir  = /var/lib/picam-recorder       # Output directory
 port = 8080                          # TCP control port
+stream_port = 8081                   # HTTP port for GET /stream (always live, see Features above)
 pre  = 10                            # Pre-buffer seconds
 post = 10                            # Post-buffer seconds
-mjpeg_quality = 85                   # 1-100 IJG scale (libjpeg-turbo)
+mjpeg_quality_high = 85              # 1-100 IJG scale (libjpeg-turbo) -- also what recordings use
+mjpeg_quality_low  = 40              # 1-100 IJG scale (libjpeg-turbo)
 ```
 
 All options can be overridden on the command line:
@@ -93,9 +96,11 @@ picam-recorder \
   --raw-port 8560 \
   --dir /var/recordings \
   --port 8080 \
+  --stream-port 8081 \
   --pre 15 \
   --post 5 \
-  --mjpeg-quality 85
+  --mjpeg-quality-high 85 \
+  --mjpeg-quality-low 40
 ```
 
 ## Systemd service
@@ -106,6 +111,14 @@ sudo journalctl -fu picam-recorder
 ```
 
 The service restarts automatically on failure (5 s delay) and is pinned to CPU core 2.
+
+## Streaming
+
+`GET /stream?stream=main-high|main-low` on `stream_port` (default 8081): `multipart/x-mixed-replace` MJPEG, always live — the same frames end up here whether or not `start`/`stop` has been called on the control port.
+
+```bash
+curl http://127.0.0.1:8081/stream?stream=main-high -o /dev/null
+```
 
 ## Control protocol
 

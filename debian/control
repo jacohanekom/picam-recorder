@@ -21,3 +21,10 @@ Description: picam-raw stream recorder with pre/post buffer
  uses for its own live MJPEG tiers -- rather than FFmpeg's built-in
  MJPEG encoder; FFmpeg (libavformat/libavcodec/libavutil) is still
  linked, but only for AVI muxing.
+ .
+ Every captured frame is also compressed at a second, lower quality and
+ published continuously as two live MJPEG streams over HTTP (GET
+ /stream?stream=main-high|main-low), independent of whether a recording
+ is in progress -- picam-orchestrator-go proxies these straight through
+ to its own live main view instead of separately re-compressing the
+ same frames itself.

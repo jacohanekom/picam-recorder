@@ -20,11 +20,20 @@
  * sibling picam-orchestrator-go uses for its own live MJPEG tiers (see
  * that project's internal/snapshot) -- rather than FFmpeg's built-in
  * MJPEG encoder this file used before: same quality scale (1-100, IJG),
- * same "no RGB round-trip, compress the YUV planes directly" approach,
- * so a recording's JPEG quality is now directly comparable to what's
- * live-streamed. FFmpeg (libavformat/libavcodec/libavutil) is still
- * linked, but only for AVI muxing (see AviWriter) -- it no longer does
- * any of the actual JPEG compression.
+ * same "no RGB round-trip, compress the YUV planes directly" approach.
+ * FFmpeg (libavformat/libavcodec/libavutil) is still linked, but only for
+ * AVI muxing (see AviWriter) -- it no longer does any of the actual JPEG
+ * compression.
+ *
+ * Every captured frame is compressed at TWO qualities (mjpeg_quality_high/
+ * low) and published continuously over HTTP (see StreamServer) as two
+ * separate MJPEG streams -- "main-high" and "main-low" -- regardless of
+ * whether a recording is in progress. This is what lets
+ * picam-orchestrator-go proxy this process's own live main-quality
+ * output instead of separately re-compressing the same frames itself for
+ * its live (non-annotated, no-OSD) main view; only the higher-quality
+ * stream is ever written into a recording's AVI file or kept in the
+ * pre-buffer.
  *
  * Dependencies:
  *   - FFmpeg libs: libavformat, libavcodec, libavutil (AVI muxing only)
@@ -40,7 +49,14 @@
  *   ./picam-recorder [--config recorder.ini] [--raw-host <host>] [--raw-port <n>]
  *                    [--raw-width <n>] [--raw-height <n>] [--raw-fps <n>]
  *                    [--raw-stride <n>] [--port <n>] [--pre <s>] [--post <s>]
- *                    [--mjpeg-quality <1-100>]
+ *                    [--mjpeg-quality-high <1-100>] [--mjpeg-quality-low <1-100>]
+ *                    [--stream-port <n>]
+ *
+ * Streaming — GET /stream?stream=main-high|main-low on --stream-port
+ * (default 8081): multipart/x-mixed-replace MJPEG, always live, whether
+ * or not a recording is currently in progress:
+ *
+ *     curl http://127.0.0.1:8081/stream?stream=main-high -o /dev/null
  *
  * Control — TCP plain-text protocol (one command per line):
  *
@@ -119,9 +135,10 @@ using TjHandlePtr = std::unique_ptr<void, TjHandleDeleter>;
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr int    kDefaultPort     = 8080;
-static constexpr double kDefaultPreSecs  = 10.0;
-static constexpr double kDefaultPostSecs = 10.0;
+static constexpr int    kDefaultPort       = 8080;
+static constexpr int    kDefaultStreamPort = 8081;
+static constexpr double kDefaultPreSecs    = 10.0;
+static constexpr double kDefaultPostSecs   = 10.0;
 
 // The CPU core main() pins the whole process to at startup (see its
 // "Pin this process to CPU core 2" step) and that the systemd unit's
@@ -156,14 +173,18 @@ struct Config {
     int         rawFps    = 30;
     int         rawStride = 0;      // 0 = same as rawWidth
     std::string dir       = "recordings";
-    int         port      = kDefaultPort;
+    int         port       = kDefaultPort;
+    int         streamPort = kDefaultStreamPort;
     double      preSecs   = kDefaultPreSecs;
     double      postSecs  = kDefaultPostSecs;
-    // TurboJPEG's 1-100 IJG quality scale -- same scale and same default
-    // as picam-orchestrator-go's own main-high live tier (see that
-    // project's internal/snapshot), since a recording should look at
-    // least as good as the best live view of the same moment.
-    int         mjpegQuality = 85;
+    // TurboJPEG's 1-100 IJG quality scale -- same scale and same defaults
+    // as picam-orchestrator-go's own main-high/main-low live tiers (see
+    // that project's internal/snapshot), so the two continuously
+    // published streams (see StreamServer) look the same whether a
+    // browser is watching picam-orchestrator's proxy of them or (via
+    // "high") a finished recording made from the same frames.
+    int         mjpegQualityHigh = 85;
+    int         mjpegQualityLow  = 40;
 };
 
 // Applies /etc/aipicam/streams.conf's [stream] main_width/main_height/
@@ -260,9 +281,11 @@ static Config loadIni(const std::string& path)
         else if (key == "raw_stride") cfg.rawStride = std::stoi(val);
         else if (key == "dir")        cfg.dir       = val;
         else if (key == "port")       cfg.port      = std::stoi(val);
+        else if (key == "stream_port") cfg.streamPort = std::stoi(val);
         else if (key == "pre")        cfg.preSecs   = std::stod(val);
         else if (key == "post")       cfg.postSecs  = std::stod(val);
-        else if (key == "mjpeg_quality") cfg.mjpegQuality = std::stoi(val);
+        else if (key == "mjpeg_quality_high") cfg.mjpegQualityHigh = std::stoi(val);
+        else if (key == "mjpeg_quality_low")  cfg.mjpegQualityLow  = std::stoi(val);
         else
             std::cerr << "[cfg] " << path << ":" << lineNo << ": unknown key '" << key << "'\n";
     }
@@ -550,6 +573,16 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DualJpeg -- one frame, compressed at both published qualities (see
+// Recorder::captureFrame). Recording/pre-buffer only ever use .high;
+// StreamServer publishes both, unconditionally, as separate streams.
+// ─────────────────────────────────────────────────────────────────────────────
+struct DualJpeg {
+    std::vector<uint8_t> high;
+    std::vector<uint8_t> low;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // JpegReorderBuffer
 //
 // A single core's worth of MJPEG encoding can't keep up with 30fps at
@@ -573,12 +606,12 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 class JpegReorderBuffer {
 public:
-    using Ready = std::function<void(std::vector<uint8_t>, int64_t, uint32_t)>;
+    using Ready = std::function<void(DualJpeg, int64_t, uint32_t)>;
 
     JpegReorderBuffer(size_t maxWindow, Ready onReady)
         : maxWindow_(maxWindow), onReady_(std::move(onReady)) {}
 
-    void submit(std::vector<uint8_t> jpeg, int64_t timestampUs, uint32_t frameSeq)
+    void submit(DualJpeg jpeg, int64_t timestampUs, uint32_t frameSeq)
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (!started_) { next_ = frameSeq; started_ = true; }
@@ -606,8 +639,8 @@ public:
 
 private:
     struct Item {
-        std::vector<uint8_t> jpeg;
-        int64_t               timestampUs;
+        DualJpeg jpeg;
+        int64_t  timestampUs;
     };
 
     std::mutex               mu_;
@@ -616,6 +649,201 @@ private:
     Ready                    onReady_;
     uint32_t                 next_    = 0;
     bool                     started_ = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StreamServer -- publishes two continuous MJPEG streams (main-high,
+// main-low) over plain HTTP, independent of AVI recording state (see the
+// file's top comment). Hand-rolled HTTP, same convention as the
+// plain-text Server class below: this only ever needs to understand one
+// request line (GET /stream?stream=<tier>) before switching to writing a
+// multipart/x-mixed-replace response, so there's no reason to bring in a
+// general-purpose HTTP library for it. picam-orchestrator-go is the
+// only client this is meant for in production, relaying it on to
+// browsers -- same relationship its own GET /stream has to
+// picam-frontend-go.
+// ─────────────────────────────────────────────────────────────────────────────
+enum class StreamTier { MainHigh, MainLow };
+
+inline const char* streamTierName(StreamTier t)
+{
+    return t == StreamTier::MainLow ? "main-low" : "main-high";
+}
+
+// One subscribed downstream connection's outgoing frame queue. Decouples
+// StreamServer::broadcast (called from the capture path, must never
+// block on a slow reader) from that connection's own write, which can
+// stall on a stuck/slow client -- same shape and same bound (8, drop-
+// oldest) as picam-orchestrator-go's own streamsrv.Client.sendCh.
+class StreamClient {
+public:
+    void push(std::shared_ptr<const std::vector<uint8_t>> jpeg)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (queue_.size() >= kMaxQueue) queue_.pop_front();
+        queue_.push_back(std::move(jpeg));
+        cv_.notify_one();
+    }
+
+    // Blocks until a frame is available or shutdown is requested, whichever
+    // comes first; the periodic timeout just lets the caller re-check
+    // shutdown without a dedicated wake channel for it (mirrors
+    // FrameQueue::pop's own shape elsewhere in this file).
+    bool pop(std::shared_ptr<const std::vector<uint8_t>>& out, const std::atomic<bool>& shutdown)
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait_for(lk, std::chrono::milliseconds(500),
+                     [&] { return !queue_.empty() || shutdown.load(); });
+        if (queue_.empty()) return false;
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        return true;
+    }
+
+private:
+    static constexpr size_t kMaxQueue = 8;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::shared_ptr<const std::vector<uint8_t>>> queue_;
+};
+
+class StreamServer {
+public:
+    explicit StreamServer(int port) : port_(port) {}
+    ~StreamServer() { if (listenFd_ >= 0) ::close(listenFd_); }
+
+    void start()
+    {
+        listenFd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listenFd_ < 0)
+            throw std::runtime_error(std::string("socket: ") + strerror(errno));
+
+        int opt = 1;
+        ::setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port        = htons(static_cast<uint16_t>(port_));
+
+        if (::bind(listenFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+            throw std::runtime_error(std::string("bind: ") + strerror(errno));
+        if (::listen(listenFd_, 16) < 0)
+            throw std::runtime_error(std::string("listen: ") + strerror(errno));
+
+        std::cout << "[stream] Listening on 0.0.0.0:" << port_ << "\n";
+        acceptThread_ = std::thread([this]{ acceptLoop(); });
+    }
+
+    // Fans jpeg out to every client currently subscribed to tier,
+    // wrapping it in a shared_ptr so fan-out doesn't copy the JPEG bytes
+    // per client. Called unconditionally from Recorder for every
+    // captured frame, regardless of whether a recording is active --
+    // that's the whole point (see the file's top comment).
+    void broadcast(StreamTier tier, std::vector<uint8_t> jpeg)
+    {
+        auto shared = std::make_shared<const std::vector<uint8_t>>(std::move(jpeg));
+        std::lock_guard<std::mutex> lk(clientsMu_);
+        for (auto& c : clients_)
+            if (c.tier == tier) c.client->push(shared);
+    }
+
+private:
+    static constexpr int kMaxClients = 16;
+    static constexpr const char* kBoundary = "frame";
+
+    struct ClientEntry {
+        StreamTier tier;
+        std::shared_ptr<StreamClient> client;
+    };
+
+    void acceptLoop()
+    {
+        while (true) {
+            int clientFd = ::accept(listenFd_, nullptr, nullptr);
+            if (clientFd < 0) {
+                if (errno == EINTR) continue;
+                std::cerr << "[stream] accept: " << strerror(errno) << "\n";
+                break;
+            }
+            std::thread([this, clientFd]{ handleClient(clientFd); }).detach();
+        }
+    }
+
+    // query is everything after '?' in the request line, e.g.
+    // "stream=main-low HTTP/1.1" -- unrecognized/missing defaults to
+    // main-high, mirroring picam-orchestrator-go's own ParseStream default.
+    static StreamTier parseTier(const std::string& query)
+    {
+        return query.find("stream=main-low") != std::string::npos
+            ? StreamTier::MainLow : StreamTier::MainHigh;
+    }
+
+    void handleClient(int fd)
+    {
+        FILE* fp = ::fdopen(fd, "r+");
+        if (!fp) { ::close(fd); return; }
+
+        // Read (and discard) the request: the first line carries the
+        // path/query this cares about; everything up to the blank line
+        // that ends the headers is still consumed so a well-behaved
+        // HTTP/1.1 client doesn't have its own unread request bytes
+        // confuse anything.
+        char line[4096];
+        std::string requestLine;
+        bool first = true;
+        while (std::fgets(line, sizeof(line), fp)) {
+            if (first) { requestLine = line; first = false; }
+            if (std::strcmp(line, "\r\n") == 0 || std::strcmp(line, "\n") == 0) break;
+        }
+        if (requestLine.empty()) { std::fclose(fp); return; }
+
+        StreamTier tier = StreamTier::MainHigh;
+        auto qpos = requestLine.find('?');
+        if (qpos != std::string::npos) tier = parseTier(requestLine.substr(qpos + 1));
+
+        auto client = std::make_shared<StreamClient>();
+        {
+            std::lock_guard<std::mutex> lk(clientsMu_);
+            if (static_cast<int>(clients_.size()) >= kMaxClients) {
+                std::fclose(fp);
+                return;
+            }
+            clients_.push_back(ClientEntry{ tier, client });
+        }
+        std::cout << "[stream] client connected, stream=" << streamTierName(tier) << "\n";
+
+        std::fprintf(fp,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: multipart/x-mixed-replace; boundary=%s\r\n"
+            "Cache-Control: no-cache, no-store\r\n"
+            "\r\n", kBoundary);
+        std::fflush(fp);
+
+        std::shared_ptr<const std::vector<uint8_t>> jpeg;
+        while (client->pop(jpeg, shutdown_)) {
+            std::fprintf(fp, "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                         kBoundary, jpeg->size());
+            if (std::fwrite(jpeg->data(), 1, jpeg->size(), fp) != jpeg->size()) break;
+            if (std::fprintf(fp, "\r\n") < 0) break;
+            if (std::fflush(fp) != 0) break;
+        }
+
+        std::fclose(fp);
+
+        std::lock_guard<std::mutex> lk(clientsMu_);
+        for (auto it = clients_.begin(); it != clients_.end(); ++it) {
+            if (it->client == client) { clients_.erase(it); break; }
+        }
+    }
+
+    int         port_;
+    int         listenFd_ = -1;
+    std::thread acceptThread_;
+    std::atomic<bool> shutdown_{ false }; // never set -- process exit tears this down, matching Server's own convention
+
+    std::mutex               clientsMu_;
+    std::vector<ClientEntry> clients_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -641,9 +869,11 @@ public:
                       int         rawFps,
                       int         rawStride,
                       std::string dir,
-                      double preBufferSecs  = kDefaultPreSecs,
-                      double postBufferSecs = kDefaultPostSecs,
-                      int    mjpegQuality   = 85)
+                      StreamServer* streamSrv,
+                      double preBufferSecs   = kDefaultPreSecs,
+                      double postBufferSecs  = kDefaultPostSecs,
+                      int    mjpegQualityHigh = 85,
+                      int    mjpegQualityLow  = 40)
         : rawHost_(std::move(rawHost))
         , rawPort_(rawPort)
         , rawWidth_(rawWidth)
@@ -651,7 +881,9 @@ public:
         , rawFps_(rawFps)
         , rawStride_(rawStride > 0 ? rawStride : rawWidth)
         , dir_(std::move(dir))
-        , mjpegQuality_(mjpegQuality)
+        , mjpegQualityHigh_(mjpegQualityHigh)
+        , mjpegQualityLow_(mjpegQualityLow)
+        , streamSrv_(streamSrv)
         , preBuf_(preBufferSecs)
         , preBufferSecs_(preBufferSecs)
         , postBufferSecs_(postBufferSecs)
@@ -662,7 +894,7 @@ public:
         , frameQueue_(static_cast<size_t>(std::max(rawFps * 2, 30)))
         , numCaptureWorkers_(static_cast<int>(onlineCpuCount()))
         , reorder_(static_cast<size_t>(numCaptureWorkers_) * 2,
-                   [this](std::vector<uint8_t> jpeg, int64_t ts, uint32_t seq) {
+                   [this](DualJpeg jpeg, int64_t ts, uint32_t seq) {
                        publishCapturedFrame(std::move(jpeg), ts, seq);
                    })
     {
@@ -782,17 +1014,27 @@ public:
 
 private:
     // Dispatches one freshly JPEG-captured frame, already back in
-    // strict frameSeq order courtesy of reorder_: always into the
-    // rolling pre-buffer, and additionally straight into the current
-    // recording's open AVI file if one is active.
-    void onCapturedFrame(std::vector<uint8_t> jpeg, int64_t timestampUs, uint32_t frameSeq)
+    // strict frameSeq order courtesy of reorder_: broadcasts both
+    // qualities unconditionally (whether or not a recording is active --
+    // this stream publishes always, see the file's top comment), and
+    // separately writes the high-quality one into the rolling pre-buffer
+    // plus (if one is active) the current recording's open AVI file.
+    void onCapturedFrame(DualJpeg jpeg, int64_t timestampUs, uint32_t frameSeq)
     {
         TP wallTime = std::chrono::system_clock::time_point(std::chrono::microseconds(timestampUs));
 
+        if (streamSrv_) {
+            // .high is still needed below (AviWriter/preBuf_), so this
+            // leg gets a copy; .low is never used again after this, so
+            // it can move straight in.
+            streamSrv_->broadcast(StreamTier::MainHigh, jpeg.high);
+            streamSrv_->broadcast(StreamTier::MainLow, std::move(jpeg.low));
+        }
+
         std::lock_guard<std::mutex> lk(mu_);
         if ((state_ == RecordState::Recording || state_ == RecordState::Draining) && aviWriter_)
-            aviWriter_->writeFrame(jpeg, timestampUs, frameSeq);
-        preBuf_.push(std::move(jpeg), timestampUs, wallTime, frameSeq);
+            aviWriter_->writeFrame(jpeg.high, timestampUs, frameSeq);
+        preBuf_.push(std::move(jpeg.high), timestampUs, wallTime, frameSeq);
     }
 
     // reorder_'s onReady callback: called synchronously, one frame at a
@@ -801,7 +1043,7 @@ private:
     // first frame has now actually been published" -- unlike checking
     // this inside a capture worker directly, which could fire based on
     // whichever worker happened to finish its own encode first.
-    void publishCapturedFrame(std::vector<uint8_t> jpeg, int64_t timestampUs, uint32_t frameSeq)
+    void publishCapturedFrame(DualJpeg jpeg, int64_t timestampUs, uint32_t frameSeq)
     {
         onCapturedFrame(std::move(jpeg), timestampUs, frameSeq);
 
@@ -899,14 +1141,19 @@ private:
         return h;
     }
 
-    // ── JPEG-encode one raw YUV420 frame and submit it for reordering ────────
+    // ── JPEG-encode one raw YUV420 frame at both published qualities, and
+    // submit the pair for reordering ──────────────────────────────────
     //
     // Compresses the reassembled YUV420 buffer's planes directly via
     // TurboJPEG's tjCompressFromYUVPlanes -- same approach as
     // picam-orchestrator-go's internal/snapshot.Encode: no RGB round-
     // trip, and the source's own row stride is passed straight through,
     // so (unlike the old FFmpeg AVFrame path this replaced) there's no
-    // separate row-by-row copy to strip stride padding first.
+    // separate row-by-row copy to strip stride padding first. Two
+    // sequential calls against the same tjhandle (safe -- a handle just
+    // isn't safe to use from more than one thread at once, see
+    // JpegEncoderHandle's own comment) produce the high- and low-quality
+    // versions this process always publishes (see DualJpeg).
     void captureFrame(JpegEncoderHandle& enc,
                        const std::vector<uint8_t>& yuv, int64_t timestampUs, uint32_t frameSeq)
     {
@@ -928,17 +1175,30 @@ private:
         };
         int strides[3] = { rawStride_, uvStride, uvStride };
 
+        DualJpeg dual;
+        if (!compressOne(enc, planes, strides, mjpegQualityHigh_, dual.high)) return;
+        if (!compressOne(enc, planes, strides, mjpegQualityLow_, dual.low)) return;
+
+        reorder_.submit(std::move(dual), timestampUs, frameSeq);
+    }
+
+    // Runs a single tjCompressFromYUVPlanes call at the given quality,
+    // writing the result into out. Split out of captureFrame purely to
+    // avoid repeating the call twice inline (once per quality).
+    bool compressOne(JpegEncoderHandle& enc, const unsigned char* planes[3], const int strides[3],
+                      int quality, std::vector<uint8_t>& out)
+    {
         unsigned char* jpegBuf  = nullptr;
         unsigned long  jpegSize = 0;
         int ret = tjCompressFromYUVPlanes(enc.tj.get(), planes, rawWidth_, strides, rawHeight_,
-                                           TJSAMP_420, &jpegBuf, &jpegSize, mjpegQuality_, 0);
+                                           TJSAMP_420, &jpegBuf, &jpegSize, quality, 0);
         if (ret != 0) {
             std::cerr << "[cap] tjCompressFromYUVPlanes failed: " << tjGetErrorStr2(enc.tj.get()) << "\n";
-            return;
+            return false;
         }
-
-        reorder_.submit(std::vector<uint8_t>(jpegBuf, jpegBuf + jpegSize), timestampUs, frameSeq);
+        out.assign(jpegBuf, jpegBuf + jpegSize);
         tjFree(jpegBuf);
+        return true;
     }
 
     // ── Connect to picam-raw UDP stream, reassemble frames, capture ───────────
@@ -1155,7 +1415,9 @@ private:
     int                            rawFps_;
     int                            rawStride_;
     std::string                    dir_;
-    int                            mjpegQuality_;
+    int                            mjpegQualityHigh_;
+    int                            mjpegQualityLow_;
+    StreamServer*                  streamSrv_; // not owned; outlives this Recorder (see main())
     RollingBuffer                  preBuf_;
     double                         preBufferSecs_;
     double                         postBufferSecs_;
@@ -1372,9 +1634,11 @@ int main(int argc, char* argv[])
         else if (std::string(argv[i]) == "--raw-stride" && i+1 < argc) cfg.rawStride = std::stoi(argv[++i]);
         else if (std::string(argv[i]) == "--dir"        && i+1 < argc) cfg.dir       = argv[++i];
         else if (std::string(argv[i]) == "--port"       && i+1 < argc) cfg.port      = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--stream-port" && i+1 < argc) cfg.streamPort = std::stoi(argv[++i]);
         else if (std::string(argv[i]) == "--pre"        && i+1 < argc) cfg.preSecs   = std::stod(argv[++i]);
         else if (std::string(argv[i]) == "--post"       && i+1 < argc) cfg.postSecs  = std::stod(argv[++i]);
-        else if (std::string(argv[i]) == "--mjpeg-quality" && i+1 < argc) cfg.mjpegQuality = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--mjpeg-quality-high" && i+1 < argc) cfg.mjpegQualityHigh = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--mjpeg-quality-low"  && i+1 < argc) cfg.mjpegQualityLow  = std::stoi(argv[++i]);
         else if (std::string(argv[i]) == "--config"     && i+1 < argc) ++i;
     }
 
@@ -1397,16 +1661,27 @@ int main(int argc, char* argv[])
               << "[main] Recordings:   " << cfg.dir     << "\n"
               << "[main] Pre-buffer:   " << cfg.preSecs << "s\n"
               << "[main] Post-buffer:  " << cfg.postSecs << "s\n"
-              << "[main] MJPEG quality:" << cfg.mjpegQuality << " (1-100 IJG scale, libjpeg-turbo)\n"
+              << "[main] MJPEG quality:" << " high=" << cfg.mjpegQualityHigh
+              << " low=" << cfg.mjpegQualityLow << " (1-100 IJG scale, libjpeg-turbo)\n"
+              << "[main] Stream HTTP:  0.0.0.0:" << cfg.streamPort
+              << "  (GET /stream?stream=main-high|main-low, always live)\n"
               << "[main] Control TCP:  0.0.0.0:" << cfg.port << "\n"
               << "[main]   echo 'start 111-222-333' | nc 127.0.0.1 " << cfg.port << "\n"
               << "[main]   echo 'stop'              | nc 127.0.0.1 " << cfg.port << "\n"
               << "[main]   echo 'status'            | nc 127.0.0.1 " << cfg.port << "\n"
               << "[main]   echo 'list'              | nc 127.0.0.1 " << cfg.port << "\n";
 
+    // Constructed (and started) ahead of Recorder so it's ready to
+    // accept connections and start fanning out frames the moment the
+    // first one is captured -- Recorder broadcasts into it
+    // unconditionally, whether or not a recording is active.
+    StreamServer streamSrv(cfg.streamPort);
+    streamSrv.start();
+
     Recorder rec(cfg.rawHost, cfg.rawPort,
                  cfg.rawWidth, cfg.rawHeight, cfg.rawFps, cfg.rawStride,
-                 cfg.dir, cfg.preSecs, cfg.postSecs, cfg.mjpegQuality);
+                 cfg.dir, &streamSrv, cfg.preSecs, cfg.postSecs,
+                 cfg.mjpegQualityHigh, cfg.mjpegQualityLow);
     Server   srv(rec, cfg.port);
     srv.run();
 
