@@ -50,7 +50,7 @@
  *                    [--raw-width <n>] [--raw-height <n>] [--raw-fps <n>]
  *                    [--raw-stride <n>] [--port <n>] [--pre <s>] [--post <s>]
  *                    [--mjpeg-quality-high <1-100>] [--mjpeg-quality-low <1-100>]
- *                    [--stream-port <n>]
+ *                    [--main-low-scale-divisor <n>] [--stream-port <n>]
  *
  * Streaming — GET /stream?stream=main-high|main-low on --stream-port
  * (default 8081): multipart/x-mixed-replace MJPEG, always live, whether
@@ -179,12 +179,22 @@ struct Config {
     double      postSecs  = kDefaultPostSecs;
     // TurboJPEG's 1-100 IJG quality scale -- same scale and same defaults
     // as picam-orchestrator-go's own main-high/main-low live tiers (see
-    // that project's internal/snapshot), so the two continuously
-    // published streams (see StreamServer) look the same whether a
-    // browser is watching picam-orchestrator's proxy of them or (via
-    // "high") a finished recording made from the same frames.
+    // that project's internal/snapshot), so main-high looks the same
+    // whether a browser is watching picam-orchestrator's proxy of it or
+    // a finished recording made from the same frames (recordings always
+    // use high, see AviWriter/RollingBuffer in onCapturedFrame).
     int         mjpegQualityHigh = 85;
     int         mjpegQualityLow  = 40;
+    // main-low is downscaled by this factor (both dimensions, rounded
+    // down to even) before compressing -- unlike quality alone,
+    // shrinking the pixel count directly cuts TurboJPEG's own compress
+    // cost by roughly divisor^2, which is what actually keeps capture
+    // sustainable at 30fps on real hardware (see captureFrame's own
+    // comment: two full-native-resolution compressions per frame was
+    // confirmed dropping frames in practice). 1 disables downscaling
+    // (main-low then compresses the untouched native frame, just at a
+    // lower quality -- the original, CPU-heavier design).
+    int         mainLowScaleDivisor = 2;
 };
 
 // Applies /etc/aipicam/streams.conf's [stream] main_width/main_height/
@@ -286,6 +296,7 @@ static Config loadIni(const std::string& path)
         else if (key == "post")       cfg.postSecs  = std::stod(val);
         else if (key == "mjpeg_quality_high") cfg.mjpegQualityHigh = std::stoi(val);
         else if (key == "mjpeg_quality_low")  cfg.mjpegQualityLow  = std::stoi(val);
+        else if (key == "main_low_scale_divisor") cfg.mainLowScaleDivisor = std::stoi(val);
         else
             std::cerr << "[cfg] " << path << ":" << lineNo << ": unknown key '" << key << "'\n";
     }
@@ -873,7 +884,8 @@ public:
                       double preBufferSecs   = kDefaultPreSecs,
                       double postBufferSecs  = kDefaultPostSecs,
                       int    mjpegQualityHigh = 85,
-                      int    mjpegQualityLow  = 40)
+                      int    mjpegQualityLow  = 40,
+                      int    mainLowScaleDivisor = 2)
         : rawHost_(std::move(rawHost))
         , rawPort_(rawPort)
         , rawWidth_(rawWidth)
@@ -883,6 +895,7 @@ public:
         , dir_(std::move(dir))
         , mjpegQualityHigh_(mjpegQualityHigh)
         , mjpegQualityLow_(mjpegQualityLow)
+        , mainLowScaleDivisor_(mainLowScaleDivisor)
         , streamSrv_(streamSrv)
         , preBuf_(preBufferSecs)
         , preBufferSecs_(preBufferSecs)
@@ -1149,11 +1162,19 @@ private:
     // picam-orchestrator-go's internal/snapshot.Encode: no RGB round-
     // trip, and the source's own row stride is passed straight through,
     // so (unlike the old FFmpeg AVFrame path this replaced) there's no
-    // separate row-by-row copy to strip stride padding first. Two
-    // sequential calls against the same tjhandle (safe -- a handle just
-    // isn't safe to use from more than one thread at once, see
-    // JpegEncoderHandle's own comment) produce the high- and low-quality
-    // versions this process always publishes (see DualJpeg).
+    // separate row-by-row copy to strip stride padding first.
+    //
+    // main-high always compresses the untouched native frame. main-low
+    // is downscaled first (mainLowScaleDivisor_, default 2 -- see
+    // Config's own comment): two full-native-resolution compressions
+    // per frame, continuously, turned out not to be sustainable on real
+    // hardware (confirmed dropping frames in practice -- see
+    // FrameQueue's "Capture falling behind" warning), and shrinking the
+    // pixel count cuts TurboJPEG's own cost by roughly divisor^2, which
+    // the box-filter downscale pass itself costs nowhere near as much
+    // as. Both compressions run sequentially against the same tjhandle
+    // (safe -- a handle just isn't safe to use from more than one
+    // thread at once, see JpegEncoderHandle's own comment).
     void captureFrame(JpegEncoderHandle& enc,
                        const std::vector<uint8_t>& yuv, int64_t timestampUs, uint32_t frameSeq)
     {
@@ -1176,21 +1197,37 @@ private:
         int strides[3] = { rawStride_, uvStride, uvStride };
 
         DualJpeg dual;
-        if (!compressOne(enc, planes, strides, mjpegQualityHigh_, dual.high)) return;
-        if (!compressOne(enc, planes, strides, mjpegQualityLow_, dual.low)) return;
+        if (!compressOne(enc, planes, strides, rawWidth_, rawHeight_, mjpegQualityHigh_, dual.high)) return;
+
+        if (mainLowScaleDivisor_ <= 1) {
+            if (!compressOne(enc, planes, strides, rawWidth_, rawHeight_, mjpegQualityLow_, dual.low)) return;
+        } else {
+            std::vector<uint8_t> scaled;
+            int lowW, lowH;
+            downscaleI420(yuv, rawWidth_, rawHeight_, rawStride_, mainLowScaleDivisor_, scaled, lowW, lowH);
+
+            const int lowUvW = lowW / 2, lowUvH = lowH / 2;
+            const unsigned char* lowPlanes[3] = {
+                scaled.data(),
+                scaled.data() + static_cast<size_t>(lowW) * lowH,
+                scaled.data() + static_cast<size_t>(lowW) * lowH + static_cast<size_t>(lowUvW) * lowUvH,
+            };
+            int lowStrides[3] = { lowW, lowUvW, lowUvW };
+            if (!compressOne(enc, lowPlanes, lowStrides, lowW, lowH, mjpegQualityLow_, dual.low)) return;
+        }
 
         reorder_.submit(std::move(dual), timestampUs, frameSeq);
     }
 
     // Runs a single tjCompressFromYUVPlanes call at the given quality,
     // writing the result into out. Split out of captureFrame purely to
-    // avoid repeating the call twice inline (once per quality).
+    // avoid repeating the call twice inline (once per quality/resolution).
     bool compressOne(JpegEncoderHandle& enc, const unsigned char* planes[3], const int strides[3],
-                      int quality, std::vector<uint8_t>& out)
+                      int width, int height, int quality, std::vector<uint8_t>& out)
     {
         unsigned char* jpegBuf  = nullptr;
         unsigned long  jpegSize = 0;
-        int ret = tjCompressFromYUVPlanes(enc.tj.get(), planes, rawWidth_, strides, rawHeight_,
+        int ret = tjCompressFromYUVPlanes(enc.tj.get(), planes, width, strides, height,
                                            TJSAMP_420, &jpegBuf, &jpegSize, quality, 0);
         if (ret != 0) {
             std::cerr << "[cap] tjCompressFromYUVPlanes failed: " << tjGetErrorStr2(enc.tj.get()) << "\n";
@@ -1199,6 +1236,55 @@ private:
         out.assign(jpegBuf, jpegBuf + jpegSize);
         tjFree(jpegBuf);
         return true;
+    }
+
+    // Box-filter-averages a single 8-bit plane down by divisor in both
+    // dimensions (dstW/dstH are the caller's responsibility to size
+    // correctly -- see downscaleI420). srcStride lets this read
+    // directly out of a padded source plane (e.g. the Y plane's own
+    // rawStride_) with no separate unpadding copy first.
+    static void downscalePlane(const uint8_t* src, int srcStride, uint8_t* dst, int dstW, int dstH, int divisor)
+    {
+        for (int oy = 0; oy < dstH; ++oy) {
+            for (int ox = 0; ox < dstW; ++ox) {
+                int sum = 0;
+                for (int fy = 0; fy < divisor; ++fy) {
+                    const uint8_t* row = src + static_cast<size_t>(oy * divisor + fy) * srcStride + ox * divisor;
+                    for (int fx = 0; fx < divisor; ++fx) sum += row[fx];
+                }
+                dst[static_cast<size_t>(oy) * dstW + ox] = static_cast<uint8_t>(sum / (divisor * divisor));
+            }
+        }
+    }
+
+    // Downscales a packed I420 buffer by divisor (both dimensions,
+    // rounded down to even so 4:2:0 subsampling stays valid), writing a
+    // new tightly-packed I420 buffer into out and reporting its
+    // dimensions via outW/outH. Used only for main-low's compression
+    // (see captureFrame) -- main-high always compresses the untouched
+    // native frame.
+    static void downscaleI420(const std::vector<uint8_t>& src, int srcW, int srcH, int srcStride, int divisor,
+                               std::vector<uint8_t>& out, int& outW, int& outH)
+    {
+        outW = std::max((srcW / divisor) & ~1, 2);
+        outH = std::max((srcH / divisor) & ~1, 2);
+
+        const int    srcUvStride = srcStride / 2;
+        const size_t srcYBytes   = static_cast<size_t>(srcStride) * srcH;
+        const size_t srcUvBytes  = static_cast<size_t>(srcUvStride) * (srcH / 2);
+        const uint8_t* srcY = src.data();
+        const uint8_t* srcU = src.data() + srcYBytes;
+        const uint8_t* srcV = src.data() + srcYBytes + srcUvBytes;
+
+        const int outUvW = outW / 2, outUvH = outH / 2;
+        out.assign(static_cast<size_t>(outW) * outH + 2 * static_cast<size_t>(outUvW) * outUvH, 0);
+        uint8_t* dstY = out.data();
+        uint8_t* dstU = out.data() + static_cast<size_t>(outW) * outH;
+        uint8_t* dstV = dstU + static_cast<size_t>(outUvW) * outUvH;
+
+        downscalePlane(srcY, srcStride, dstY, outW, outH, divisor);
+        downscalePlane(srcU, srcUvStride, dstU, outUvW, outUvH, divisor);
+        downscalePlane(srcV, srcUvStride, dstV, outUvW, outUvH, divisor);
     }
 
     // ── Connect to picam-raw UDP stream, reassemble frames, capture ───────────
@@ -1417,6 +1503,7 @@ private:
     std::string                    dir_;
     int                            mjpegQualityHigh_;
     int                            mjpegQualityLow_;
+    int                            mainLowScaleDivisor_;
     StreamServer*                  streamSrv_; // not owned; outlives this Recorder (see main())
     RollingBuffer                  preBuf_;
     double                         preBufferSecs_;
@@ -1639,6 +1726,7 @@ int main(int argc, char* argv[])
         else if (std::string(argv[i]) == "--post"       && i+1 < argc) cfg.postSecs  = std::stod(argv[++i]);
         else if (std::string(argv[i]) == "--mjpeg-quality-high" && i+1 < argc) cfg.mjpegQualityHigh = std::stoi(argv[++i]);
         else if (std::string(argv[i]) == "--mjpeg-quality-low"  && i+1 < argc) cfg.mjpegQualityLow  = std::stoi(argv[++i]);
+        else if (std::string(argv[i]) == "--main-low-scale-divisor" && i+1 < argc) cfg.mainLowScaleDivisor = std::stoi(argv[++i]);
         else if (std::string(argv[i]) == "--config"     && i+1 < argc) ++i;
     }
 
@@ -1663,6 +1751,11 @@ int main(int argc, char* argv[])
               << "[main] Post-buffer:  " << cfg.postSecs << "s\n"
               << "[main] MJPEG quality:" << " high=" << cfg.mjpegQualityHigh
               << " low=" << cfg.mjpegQualityLow << " (1-100 IJG scale, libjpeg-turbo)\n"
+              << "[main] main-low scale: 1/" << cfg.mainLowScaleDivisor
+              << (cfg.mainLowScaleDivisor > 1
+                      ? " (" + std::to_string(cfg.rawWidth / cfg.mainLowScaleDivisor) + "x" +
+                            std::to_string(cfg.rawHeight / cfg.mainLowScaleDivisor) + ")\n"
+                      : " (native, no downscale)\n")
               << "[main] Stream HTTP:  0.0.0.0:" << cfg.streamPort
               << "  (GET /stream?stream=main-high|main-low, always live)\n"
               << "[main] Control TCP:  0.0.0.0:" << cfg.port << "\n"
@@ -1681,7 +1774,7 @@ int main(int argc, char* argv[])
     Recorder rec(cfg.rawHost, cfg.rawPort,
                  cfg.rawWidth, cfg.rawHeight, cfg.rawFps, cfg.rawStride,
                  cfg.dir, &streamSrv, cfg.preSecs, cfg.postSecs,
-                 cfg.mjpegQualityHigh, cfg.mjpegQualityLow);
+                 cfg.mjpegQualityHigh, cfg.mjpegQualityLow, cfg.mainLowScaleDivisor);
     Server   srv(rec, cfg.port);
     srv.run();
 

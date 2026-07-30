@@ -11,6 +11,7 @@ Records a Motion-JPEG stream to AVI files with configurable pre-roll and post-ro
 - Per-core parallel JPEG capture, muxed straight into AVI as frames arrive — no batch transcode step
 - JPEG compression via libjpeg-turbo's TurboJPEG API — same encoder and 1-100 IJG quality scale as picam-orchestrator-go's own live MJPEG tiers
 - **`GET /stream?stream=main-high|main-low`** — every captured frame is compressed at two qualities and published as continuous MJPEG (`multipart/x-mixed-replace`), always, independent of whether a recording is in progress. picam-orchestrator-go proxies this straight through to its own live main view instead of separately re-compressing the same frames itself
+- `main-low` is also downscaled (default 1/2, both dimensions) before compressing — two full-native-resolution compressions per frame turned out not to be sustainable at 30fps on real hardware; see [Configuration](#configuration)
 
 ## Dependencies
 
@@ -85,6 +86,7 @@ pre  = 10                            # Pre-buffer seconds
 post = 10                            # Post-buffer seconds
 mjpeg_quality_high = 85              # 1-100 IJG scale (libjpeg-turbo) -- also what recordings use
 mjpeg_quality_low  = 40              # 1-100 IJG scale (libjpeg-turbo)
+main_low_scale_divisor = 2           # main-low is downscaled by this factor before compressing; 1 = native resolution
 ```
 
 All options can be overridden on the command line:
@@ -100,7 +102,8 @@ picam-recorder \
   --pre 15 \
   --post 5 \
   --mjpeg-quality-high 85 \
-  --mjpeg-quality-low 40
+  --mjpeg-quality-low 40 \
+  --main-low-scale-divisor 2
 ```
 
 ## Systemd service
