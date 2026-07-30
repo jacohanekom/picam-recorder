@@ -6,7 +6,7 @@
  * pre-buffer (no recording active) or written directly into the current
  * recording's open AVI/MJPEG file. One core's worth of JPEG encoding
  * can't sustain 30fps at typical recording resolutions, so capture runs
- * one independent JPEG encoder per online CPU core in parallel, with
+ * one independent JPEG compressor per online CPU core in parallel, with
  * their out-of-order output reassembled back into sequence before it
  * reaches the pre-buffer or the AVI writer. Since a JPEG frame already
  * IS its own final stored format, there's no decode/re-encode/mux step
@@ -15,20 +15,32 @@
  * from earlier in this project's history) both needed -- closing a
  * recording is just writing the AVI trailer/index, fast and synchronous.
  *
+ * JPEG compression itself uses libjpeg-turbo's TurboJPEG API
+ * (tjCompressFromYUVPlanes) -- the same SIMD-accelerated encoder the
+ * sibling picam-orchestrator-go uses for its own live MJPEG tiers (see
+ * that project's internal/snapshot) -- rather than FFmpeg's built-in
+ * MJPEG encoder this file used before: same quality scale (1-100, IJG),
+ * same "no RGB round-trip, compress the YUV planes directly" approach,
+ * so a recording's JPEG quality is now directly comparable to what's
+ * live-streamed. FFmpeg (libavformat/libavcodec/libavutil) is still
+ * linked, but only for AVI muxing (see AviWriter) -- it no longer does
+ * any of the actual JPEG compression.
+ *
  * Dependencies:
- *   - FFmpeg libs: libavformat, libavcodec, libavutil
- *   No other external dependencies.
+ *   - FFmpeg libs: libavformat, libavcodec, libavutil (AVI muxing only)
+ *   - libjpeg-turbo (TurboJPEG API): JPEG compression
  *
  * Build example (Linux / macOS):
  *   g++ -std=c++17 -O2 -pthread \
  *       main.cpp \
- *       $(pkg-config --cflags --libs libavformat libavcodec libavutil) \
+ *       $(pkg-config --cflags --libs libavformat libavcodec libavutil libturbojpeg) \
  *       -o picam-recorder
  *
  * Usage:
  *   ./picam-recorder [--config recorder.ini] [--raw-host <host>] [--raw-port <n>]
  *                    [--raw-width <n>] [--raw-height <n>] [--raw-fps <n>]
  *                    [--raw-stride <n>] [--port <n>] [--pre <s>] [--post <s>]
+ *                    [--mjpeg-quality <1-100>]
  *
  * Control — TCP plain-text protocol (one command per line):
  *
@@ -56,7 +68,7 @@
 #include <cerrno>
 #include <pthread.h>
 
-// ── FFmpeg ────────────────────────────────────────────────────────────────────
+// ── FFmpeg (AVI muxing only -- JPEG compression is libjpeg-turbo, below) ──────
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -64,6 +76,9 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
 }
+
+// ── libjpeg-turbo (TurboJPEG API) ──────────────────────────────────────────────
+#include <turbojpeg.h>
 
 // ── stdlib ────────────────────────────────────────────────────────────────────
 #include <algorithm>
@@ -94,16 +109,12 @@ using Clock  = std::chrono::system_clock;
 using TP     = Clock::time_point;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RAII wrappers for FFmpeg's C-API alloc/free pairs -- used for the
-// persistent per-capture-worker JPEG encoder, so none of that state
-// needs manual cleanup at every throw/return point.
+// RAII wrapper for a TurboJPEG compressor handle -- one persists per
+// capture worker (see JpegEncoderHandle/captureWorkerLoop), since a
+// tjhandle is not safe to share across threads.
 // ─────────────────────────────────────────────────────────────────────────────
-struct AVCodecContextDeleter { void operator()(AVCodecContext* p) const { if (p) avcodec_free_context(&p); } };
-struct AVFrameDeleter        { void operator()(AVFrame* p)        const { if (p) av_frame_free(&p); } };
-struct AVPacketDeleter       { void operator()(AVPacket* p)       const { if (p) av_packet_free(&p); } };
-using AVCodecContextPtr = std::unique_ptr<AVCodecContext, AVCodecContextDeleter>;
-using AVFramePtr        = std::unique_ptr<AVFrame, AVFrameDeleter>;
-using AVPacketPtr       = std::unique_ptr<AVPacket, AVPacketDeleter>;
+struct TjHandleDeleter { void operator()(void* h) const { if (h) tjDestroy(h); } };
+using TjHandlePtr = std::unique_ptr<void, TjHandleDeleter>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -118,8 +129,8 @@ static constexpr double kDefaultPostSecs = 10.0;
 // core-only mask by default; the UDP receive and TCP control threads
 // are meant to stay confined to it so they always get scheduled
 // promptly, uncontended by anything else this process does. Any
-// thread that needs real parallelism (JPEG capture workers, H.264
-// transcode) must widen to every OTHER core instead of every core --
+// thread that needs real parallelism (the JPEG capture workers) must
+// widen to every OTHER core instead of every core --
 // sharing this one with them would starve the receive loop of the CPU
 // time it needs to keep draining the UDP socket in time, which is
 // exactly the stall this whole pipeline exists to avoid (see "[raw]
@@ -148,6 +159,11 @@ struct Config {
     int         port      = kDefaultPort;
     double      preSecs   = kDefaultPreSecs;
     double      postSecs  = kDefaultPostSecs;
+    // TurboJPEG's 1-100 IJG quality scale -- same scale and same default
+    // as picam-orchestrator-go's own main-high live tier (see that
+    // project's internal/snapshot), since a recording should look at
+    // least as good as the best live view of the same moment.
+    int         mjpegQuality = 85;
 };
 
 // Applies /etc/aipicam/streams.conf's [stream] main_width/main_height/
@@ -246,6 +262,7 @@ static Config loadIni(const std::string& path)
         else if (key == "port")       cfg.port      = std::stoi(val);
         else if (key == "pre")        cfg.preSecs   = std::stod(val);
         else if (key == "post")       cfg.postSecs  = std::stod(val);
+        else if (key == "mjpeg_quality") cfg.mjpegQuality = std::stoi(val);
         else
             std::cerr << "[cfg] " << path << ":" << lineNo << ": unknown key '" << key << "'\n";
     }
@@ -625,7 +642,8 @@ public:
                       int         rawStride,
                       std::string dir,
                       double preBufferSecs  = kDefaultPreSecs,
-                      double postBufferSecs = kDefaultPostSecs)
+                      double postBufferSecs = kDefaultPostSecs,
+                      int    mjpegQuality   = 85)
         : rawHost_(std::move(rawHost))
         , rawPort_(rawPort)
         , rawWidth_(rawWidth)
@@ -633,6 +651,7 @@ public:
         , rawFps_(rawFps)
         , rawStride_(rawStride > 0 ? rawStride : rawWidth)
         , dir_(std::move(dir))
+        , mjpegQuality_(mjpegQuality)
         , preBuf_(preBufferSecs)
         , preBufferSecs_(preBufferSecs)
         , postBufferSecs_(postBufferSecs)
@@ -860,68 +879,39 @@ private:
         }
     }
 
-    // A JPEG encoder plus its persistent frame/packet, entirely owned by
-    // one capture worker thread -- see captureWorkerLoop. JPEG frames
-    // have no inter-frame dependencies, so N of these can run fully
-    // independently in parallel, unlike the old single persistent H.264
-    // encoder this replaced.
+    // A TurboJPEG compressor handle, entirely owned by one capture worker
+    // thread -- see captureWorkerLoop. A tjhandle is stateless between
+    // calls (unlike the old FFmpeg AVCodecContext it replaced, TurboJPEG
+    // has no persistent encoder state to speak of -- this exists purely
+    // because a tjhandle itself isn't safe to share across threads), so
+    // N of these run fully independently in parallel.
     struct JpegEncoderHandle {
-        AVCodecContextPtr ctx;
-        AVFramePtr        frame;
-        AVPacketPtr       pkt;
+        TjHandlePtr tj;
     };
 
     // ── JPEG capture encoder init (one instance per capture worker) ──────────
     JpegEncoderHandle initJpegEncoder()
     {
         JpegEncoderHandle h;
-
-        const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
-        if (!codec)
-            throw std::runtime_error("MJPEG encoder not found");
-
-        h.ctx.reset(avcodec_alloc_context3(codec));
-        if (!h.ctx)
-            throw std::runtime_error("avcodec_alloc_context3 (mjpeg) failed");
-
-        h.ctx->width          = rawWidth_;
-        h.ctx->height         = rawHeight_;
-        h.ctx->time_base      = { 1, rawFps_ };
-        h.ctx->pix_fmt        = AV_PIX_FMT_YUVJ420P; // MJPEG's native full-range format
-        // Quality: the mjpeg encoder honors qscale/global_quality via
-        // FF_QP2LAMBDA scaling; 2-5 is visually near-lossless while
-        // still compressing far enough (~10-20x vs raw) to keep the
-        // per-worker capture file and pre-buffer memory use reasonable.
-        h.ctx->flags         |= AV_CODEC_FLAG_QSCALE;
-        h.ctx->global_quality = 4 * FF_QP2LAMBDA;
-
-        int ret = avcodec_open2(h.ctx.get(), codec, nullptr);
-        if (ret < 0) {
-            char err[128]; av_strerror(ret, err, sizeof(err));
-            throw std::runtime_error(std::string("avcodec_open2 (mjpeg): ") + err);
-        }
-
-        h.frame.reset(av_frame_alloc());
-        if (!h.frame) throw std::runtime_error("av_frame_alloc (mjpeg) failed");
-        h.frame->format = AV_PIX_FMT_YUVJ420P;
-        h.frame->width  = rawWidth_;
-        h.frame->height = rawHeight_;
-        if (av_frame_get_buffer(h.frame.get(), 0) < 0)
-            throw std::runtime_error("av_frame_get_buffer (mjpeg) failed");
-
-        h.pkt.reset(av_packet_alloc());
-        if (!h.pkt) throw std::runtime_error("av_packet_alloc (mjpeg) failed");
-
+        h.tj.reset(tjInitCompress());
+        if (!h.tj)
+            throw std::runtime_error("tjInitCompress failed");
         return h;
     }
 
     // ── JPEG-encode one raw YUV420 frame and submit it for reordering ────────
-    void captureFrame(JpegEncoderHandle& enc, int64_t& pts,
+    //
+    // Compresses the reassembled YUV420 buffer's planes directly via
+    // TurboJPEG's tjCompressFromYUVPlanes -- same approach as
+    // picam-orchestrator-go's internal/snapshot.Encode: no RGB round-
+    // trip, and the source's own row stride is passed straight through,
+    // so (unlike the old FFmpeg AVFrame path this replaced) there's no
+    // separate row-by-row copy to strip stride padding first.
+    void captureFrame(JpegEncoderHandle& enc,
                        const std::vector<uint8_t>& yuv, int64_t timestampUs, uint32_t frameSeq)
     {
         const int    uvStride = rawStride_ / 2;
         const int    uvHeight = rawHeight_ / 2;
-        const int    uvWidth  = rawWidth_  / 2;
         const size_t yBytes   = static_cast<size_t>(rawStride_) * rawHeight_;
         const size_t uvBytes  = static_cast<size_t>(uvStride) * uvHeight;
 
@@ -931,28 +921,24 @@ private:
             return;
         }
 
-        if (av_frame_make_writable(enc.frame.get()) < 0) return;
+        unsigned char* planes[3] = {
+            const_cast<unsigned char*>(yuv.data()),
+            const_cast<unsigned char*>(yuv.data() + yBytes),
+            const_cast<unsigned char*>(yuv.data() + yBytes + uvBytes),
+        };
+        int strides[3] = { rawStride_, uvStride, uvStride };
 
-        // Copy each plane row-by-row, stripping stride padding
-        for (int row = 0; row < rawHeight_; ++row)
-            std::memcpy(enc.frame->data[0] + row * enc.frame->linesize[0],
-                        yuv.data() + row * rawStride_, rawWidth_);
-        for (int row = 0; row < uvHeight; ++row)
-            std::memcpy(enc.frame->data[1] + row * enc.frame->linesize[1],
-                        yuv.data() + yBytes + row * uvStride, uvWidth);
-        for (int row = 0; row < uvHeight; ++row)
-            std::memcpy(enc.frame->data[2] + row * enc.frame->linesize[2],
-                        yuv.data() + yBytes + uvBytes + row * uvStride, uvWidth);
-
-        enc.frame->pts = pts++;
-
-        if (avcodec_send_frame(enc.ctx.get(), enc.frame.get()) < 0) return;
-
-        if (avcodec_receive_packet(enc.ctx.get(), enc.pkt.get()) == 0) {
-            reorder_.submit(std::vector<uint8_t>(enc.pkt->data, enc.pkt->data + enc.pkt->size),
-                             timestampUs, frameSeq);
-            av_packet_unref(enc.pkt.get());
+        unsigned char* jpegBuf  = nullptr;
+        unsigned long  jpegSize = 0;
+        int ret = tjCompressFromYUVPlanes(enc.tj.get(), planes, rawWidth_, strides, rawHeight_,
+                                           TJSAMP_420, &jpegBuf, &jpegSize, mjpegQuality_, 0);
+        if (ret != 0) {
+            std::cerr << "[cap] tjCompressFromYUVPlanes failed: " << tjGetErrorStr2(enc.tj.get()) << "\n";
+            return;
         }
+
+        reorder_.submit(std::vector<uint8_t>(jpegBuf, jpegBuf + jpegSize), timestampUs, frameSeq);
+        tjFree(jpegBuf);
     }
 
     // ── Connect to picam-raw UDP stream, reassemble frames, capture ───────────
@@ -1120,11 +1106,10 @@ private:
         std::cout << "[cap] Worker " << workerIdx << " ready: " << rawWidth_ << "x" << rawHeight_
                   << " @" << rawFps_ << "fps  stride=" << rawStride_ << "\n";
 
-        int64_t  pts = 0;
         RawFrame f;
         while (!shutdown_) {
             if (!frameQueue_.pop(f, shutdown_)) continue; // timed out re-checking shutdown_, or woken by it
-            captureFrame(enc, pts, f.yuv, f.timestampUs, f.frameSeq);
+            captureFrame(enc, f.yuv, f.timestampUs, f.frameSeq);
         }
     }
 
@@ -1137,14 +1122,13 @@ private:
     // comment: sharing it with a CPU-bound thread starves the receive
     // loop and reintroduces "[raw] Dropped incomplete frame" one layer
     // up, as happened when this first widened to *every* core including
-    // the reserved one). The capture workers and the transcode thread
-    // both need more than one core: libx264 (transcode) and the mjpeg
-    // encoder (capture) both auto-detect their own internal thread
-    // count from how many CPUs are visible to the calling thread's
-    // affinity mask (av_cpu_count() reads sched_getaffinity()), and
-    // running N independent worker threads (capture) each eligible for
-    // every non-reserved core lets the kernel schedule them in parallel
-    // instead of stacking them onto one core.
+    // the reserved one). Unlike the old FFmpeg-based MJPEG encoder this
+    // replaced, a single tjCompressFromYUVPlanes call is single-threaded
+    // and does no CPU-affinity-based auto-detection of its own -- the
+    // reason each capture worker still widens its own affinity here is
+    // simply so the kernel can schedule all numCaptureWorkers_ of them
+    // across every non-reserved core in parallel, instead of the
+    // default core-2-only mask stacking them all onto one core.
     static void widenAffinityToAllCores(const char* logTag)
     {
         cpu_set_t cpuset;
@@ -1171,6 +1155,7 @@ private:
     int                            rawFps_;
     int                            rawStride_;
     std::string                    dir_;
+    int                            mjpegQuality_;
     RollingBuffer                  preBuf_;
     double                         preBufferSecs_;
     double                         postBufferSecs_;
@@ -1389,6 +1374,7 @@ int main(int argc, char* argv[])
         else if (std::string(argv[i]) == "--port"       && i+1 < argc) cfg.port      = std::stoi(argv[++i]);
         else if (std::string(argv[i]) == "--pre"        && i+1 < argc) cfg.preSecs   = std::stod(argv[++i]);
         else if (std::string(argv[i]) == "--post"       && i+1 < argc) cfg.postSecs  = std::stod(argv[++i]);
+        else if (std::string(argv[i]) == "--mjpeg-quality" && i+1 < argc) cfg.mjpegQuality = std::stoi(argv[++i]);
         else if (std::string(argv[i]) == "--config"     && i+1 < argc) ++i;
     }
 
@@ -1411,6 +1397,7 @@ int main(int argc, char* argv[])
               << "[main] Recordings:   " << cfg.dir     << "\n"
               << "[main] Pre-buffer:   " << cfg.preSecs << "s\n"
               << "[main] Post-buffer:  " << cfg.postSecs << "s\n"
+              << "[main] MJPEG quality:" << cfg.mjpegQuality << " (1-100 IJG scale, libjpeg-turbo)\n"
               << "[main] Control TCP:  0.0.0.0:" << cfg.port << "\n"
               << "[main]   echo 'start 111-222-333' | nc 127.0.0.1 " << cfg.port << "\n"
               << "[main]   echo 'stop'              | nc 127.0.0.1 " << cfg.port << "\n"
@@ -1419,7 +1406,7 @@ int main(int argc, char* argv[])
 
     Recorder rec(cfg.rawHost, cfg.rawPort,
                  cfg.rawWidth, cfg.rawHeight, cfg.rawFps, cfg.rawStride,
-                 cfg.dir, cfg.preSecs, cfg.postSecs);
+                 cfg.dir, cfg.preSecs, cfg.postSecs, cfg.mjpegQuality);
     Server   srv(rec, cfg.port);
     srv.run();
 

@@ -74,7 +74,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends \
                 build-essential debhelper pkg-config \
-                libavformat-dev libavcodec-dev libavutil-dev
+                libavformat-dev libavcodec-dev libavutil-dev libturbojpeg0-dev
               dpkg-buildpackage -us -uc -b
             '
 

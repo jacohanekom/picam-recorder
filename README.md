@@ -9,13 +9,16 @@ Records a Motion-JPEG stream to AVI files with configurable pre-roll and post-ro
 - TCP control server for start / stop / status / list commands
 - Sidecar CSV metadata file per recording
 - Per-core parallel JPEG capture, muxed straight into AVI as frames arrive — no batch transcode step
+- JPEG compression via libjpeg-turbo's TurboJPEG API — same encoder and 1-100 IJG quality scale as picam-orchestrator-go's own live MJPEG tiers
 
 ## Dependencies
 
 ```
-libavformat-dev  libavcodec-dev  libavutil-dev
+libavformat-dev  libavcodec-dev  libavutil-dev  libturbojpeg0-dev
 g++  pkg-config
 ```
+
+FFmpeg (libavformat/libavcodec/libavutil) is used only for AVI muxing — JPEG compression itself is libjpeg-turbo.
 
 ## Build
 
@@ -72,11 +75,13 @@ Builds run on GitHub's native `ubuntu-24.04-arm` hosted runner (no QEMU). Uses t
 `/etc/picam-recorder/recorder.ini`:
 
 ```ini
-rtsp = rtsp://127.0.0.1:8554/main   # RTSP stream URL
-dir  = /var/lib/picam-recorder      # Output directory
+raw_host = 127.0.0.1                 # picam-raw's UDP host
+raw_port = 8560                      # picam-raw's UDP port (defaults from /etc/aipicam/streams.conf)
+dir  = /var/lib/picam-recorder       # Output directory
 port = 8080                          # TCP control port
 pre  = 10                            # Pre-buffer seconds
 post = 10                            # Post-buffer seconds
+mjpeg_quality = 85                   # 1-100 IJG scale (libjpeg-turbo)
 ```
 
 All options can be overridden on the command line:
@@ -84,11 +89,13 @@ All options can be overridden on the command line:
 ```bash
 picam-recorder \
   --config /path/to/recorder.ini \
-  --rtsp rtsp://camera.local/stream \
+  --raw-host 127.0.0.1 \
+  --raw-port 8560 \
   --dir /var/recordings \
   --port 8080 \
   --pre 15 \
-  --post 5
+  --post 5 \
+  --mjpeg-quality 85
 ```
 
 ## Systemd service
