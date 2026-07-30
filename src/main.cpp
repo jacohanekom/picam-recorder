@@ -921,10 +921,10 @@ private:
             return;
         }
 
-        unsigned char* planes[3] = {
-            const_cast<unsigned char*>(yuv.data()),
-            const_cast<unsigned char*>(yuv.data() + yBytes),
-            const_cast<unsigned char*>(yuv.data() + yBytes + uvBytes),
+        const unsigned char* planes[3] = {
+            yuv.data(),
+            yuv.data() + yBytes,
+            yuv.data() + yBytes + uvBytes,
         };
         int strides[3] = { rawStride_, uvStride, uvStride };
 
